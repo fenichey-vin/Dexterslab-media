@@ -1,0 +1,267 @@
+#!/usr/bin/env python3
+"""
+encodetv — Encode and route classified media to the final library.
+
+Reads classification.json from approved review jobs and routes output:
+  tv_episode   → /srv/media/tv/<Show>/Season XX/<Show> - SxxEyy.mkv
+  movie        → /srv/media/movies/<Title> (Year)/<Title> (Year).mkv
+  special      → /srv/media/specials/<Show>/<title>.mkv
+  documentary  → /srv/media/movies/<Title> (Year)/<Title> (Year).mkv
+  play_all     → skipped (combined title)
+  deleted      → skipped
+  unknown      → skipped with warning
+"""
+
+import os
+import sys
+import json
+import re
+import subprocess
+import sqlite3
+from pathlib import Path
+from datetime import datetime, timezone
+
+sys.path.insert(0, '/home/vinnie/mediaintel')
+from config import (REVIEW_DIR, TV_DIR, MOVIES_DIR, SPECIALS_DIR,
+                    DB_PATH, HB_PRESET, HB_FILTERS, HB_AUDIO)
+
+LOG_FILE = Path('/srv/media/encode_log.txt')
+
+
+# ── DB helpers ─────────────────────────────────────────────────────────────────
+
+def _db():
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    conn.execute('PRAGMA journal_mode = WAL')
+    return conn
+
+
+def _now():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def get_approved_jobs():
+    conn = _db()
+    rows = conn.execute(
+        "SELECT * FROM jobs WHERE status='approved' ORDER BY created_at"
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def set_job_status(job_id, status):
+    conn = _db()
+    conn.execute('UPDATE jobs SET status=?, updated_at=? WHERE id=?',
+                 (status, _now(), job_id))
+    conn.commit()
+    conn.close()
+
+
+# ── Output path routing ────────────────────────────────────────────────────────
+
+def _safe(name):
+    """Strip filesystem-unsafe characters."""
+    return re.sub(r'[<>:"/\\|?*]', '', str(name)).strip('. ')
+
+
+def route_output(cls, title_num):
+    """Return (output_path, description) for a classified title. None = skip."""
+    t = cls.get('type', 'unknown')
+
+    if t in ('play_all', 'deleted', 'unknown'):
+        return None, f'[SKIP] {t}'
+
+    if t == 'tv_episode':
+        show   = _safe(cls.get('show') or 'Unknown Show')
+        season = int(cls.get('season') or 1)
+        ep     = int(cls.get('episode') or 0)
+        etitle = _safe(cls.get('episode_title') or '')
+        s_str  = f'S{season:02d}'
+        e_str  = f'E{ep:02d}' if ep else ''
+        fname  = f'{show} - {s_str}{e_str}'
+        if etitle:
+            fname += f' - {etitle}'
+        fname += '.mkv'
+        out = TV_DIR / show / f'Season {season:02d}' / fname
+        return out, fname
+
+    if t in ('movie', 'documentary'):
+        title = _safe(cls.get('movie_title') or cls.get('title') or 'Unknown Title')
+        year  = cls.get('year')
+        folder = f'{title} ({year})' if year else title
+        fname  = f'{folder}.mkv'
+        out = MOVIES_DIR / folder / fname
+        return out, fname
+
+    if t == 'special':
+        show  = _safe(cls.get('show') or 'Misc')
+        title = _safe(cls.get('title') or f'title_{title_num}')
+        fname = f'{title}.mkv'
+        out   = SPECIALS_DIR / show / fname
+        return out, fname
+
+    return None, f'[SKIP] unhandled type: {t}'
+
+
+# ── Encode ─────────────────────────────────────────────────────────────────────
+
+def encode(input_path, output_path):
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    cmd = [
+        'HandBrakeCLI',
+        '-i', str(input_path),
+        '-t', '1',
+        '-o', str(output_path),
+        '--preset', HB_PRESET,
+        *HB_FILTERS,
+        *HB_AUDIO,
+    ]
+
+    print(f'  Encoding…')
+    print(f'    Input:  {input_path}')
+    print(f'    Output: {output_path}')
+
+    result = subprocess.run(cmd)
+    return result.returncode == 0
+
+
+def _log(msg):
+    ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    line = f'[{ts}] {msg}'
+    print(line)
+    with open(LOG_FILE, 'a') as f:
+        f.write(line + '\n')
+
+
+# ── Process a job ──────────────────────────────────────────────────────────────
+
+def process_job(job):
+    job_dir  = Path(job['review_path'])
+    cls_file = job_dir / 'classification.json'
+
+    if not cls_file.exists():
+        print(f'  ERROR: classification.json not found at {cls_file}')
+        return 0, 0
+
+    with open(cls_file) as f:
+        classifications = json.load(f)
+
+    ok = 0
+    fail = 0
+
+    for key, cls in sorted(classifications.items()):
+        # key = "title_N"
+        m = re.match(r'^title_(\d+)$', key)
+        if not m:
+            continue
+        title_num = int(m.group(1))
+
+        t = cls.get('type', 'unknown')
+        if t in ('play_all', 'deleted', 'unknown'):
+            print(f'  [{key}] Skipping ({t})')
+            _log(f'SKIP {job["id"]} {key} ({t})')
+            continue
+
+        # Find the source MKV
+        title_dir = job_dir / f'title_{title_num}'
+        mkv_files = sorted(title_dir.glob('*.mkv'))
+        if not mkv_files:
+            print(f'  [{key}] ERROR: MKV not found in {title_dir}')
+            _log(f'FAIL {job["id"]} {key}: MKV missing')
+            fail += 1
+            continue
+
+        input_path = mkv_files[0]
+
+        output_path, desc = route_output(cls, title_num)
+        if output_path is None:
+            print(f'  [{key}] {desc}')
+            continue
+
+        if output_path.exists():
+            print(f'  [{key}] SKIP: output already exists: {output_path.name}')
+            _log(f'SKIP {job["id"]} {key}: already exists')
+            continue
+
+        print(f'\n  [{key}] {desc}')
+
+        start = datetime.now()
+        success = encode(input_path, output_path)
+        elapsed = int((datetime.now() - start).total_seconds())
+
+        if success:
+            ok += 1
+            _log(f'OK   {job["id"]} {key}: {output_path} ({elapsed}s)')
+        else:
+            fail += 1
+            _log(f'FAIL {job["id"]} {key}: HandBrakeCLI error')
+            print(f'  [{key}] FAILED — queue preserved.')
+
+    return ok, fail
+
+
+# ── Main ───────────────────────────────────────────────────────────────────────
+
+def main():
+    print('\n═══════════════════════════════════════════')
+    print('  encodetv — Media Intel Encoder')
+    print('═══════════════════════════════════════════\n')
+
+    jobs = get_approved_jobs()
+
+    if not jobs:
+        print('No approved jobs found. Classify titles in the dashboard first.')
+        return
+
+    print(f'Found {len(jobs)} approved job(s):\n')
+    for job in jobs:
+        cls_file = Path(job['review_path']) / 'classification.json'
+        if cls_file.exists():
+            with open(cls_file) as f:
+                data = json.load(f)
+            encodable = sum(1 for v in data.values()
+                            if v.get('type') not in ('play_all', 'deleted', 'unknown'))
+            skipped   = len(data) - encodable
+        else:
+            encodable, skipped = '?', '?'
+        print(f'  • {job["name"]}')
+        print(f'    {encodable} to encode, {skipped} skipped')
+
+    print()
+    confirm = input('Start encoding? (y/N): ').strip().lower()
+    if confirm != 'y':
+        print('Cancelled.')
+        return
+
+    total_ok   = 0
+    total_fail = 0
+    session_start = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    _log(f'=== Encode session start: {session_start} ===')
+
+    for job in jobs:
+        print(f'\n─── Job: {job["name"]} ─────────────────────────────')
+        set_job_status(job['id'], 'encoding')
+        ok, fail = process_job(job)
+        total_ok   += ok
+        total_fail += fail
+
+        if fail == 0:
+            set_job_status(job['id'], 'complete')
+            print(f'\n  Job complete: {ok} encoded, 0 failed.')
+        else:
+            set_job_status(job['id'], 'error')
+            print(f'\n  Job finished with errors: {ok} ok, {fail} failed.')
+
+    session_end = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    _log(f'=== Encode session end: {session_end} — OK:{total_ok} FAIL:{total_fail} ===')
+
+    print(f'\n═══════════════════════════════════════════')
+    print(f'  Done. Succeeded: {total_ok}  Failed: {total_fail}')
+    print(f'  Log: {LOG_FILE}')
+    print(f'═══════════════════════════════════════════\n')
+
+
+if __name__ == '__main__':
+    main()

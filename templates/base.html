@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{% block title %}Media Intel Dashboard{% endblock %}</title>
+  <link rel="stylesheet" href="/media/static/style.css">
+</head>
+<body>
+  <header class="site-header">
+    <a href="/media/" class="logo">
+      <span class="logo-icon">◈</span>
+      <span>Media Intel</span>
+    </a>
+    <nav class="header-nav">
+      <a href="/media/" class="nav-link">Dashboard</a>
+    </nav>
+  </header>
+
+  <main class="main-content">
+    {% block content %}{% endblock %}
+  </main>
+
+  <script src="/media/static/app.js"></script>
+  {% block extra_js %}{% endblock %}
+</body>
+</html>

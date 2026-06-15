@@ -1,0 +1,216 @@
+{% extends "base.html" %}
+{% block title %}{{ job.name }} — Media Intel{% endblock %}
+
+{% if job.status == 'ingesting' %}
+<meta http-equiv="refresh" content="5">
+{% endif %}
+
+{% block content %}
+<div class="page-header">
+  <div>
+    <a href="/media/" class="back-link">← Dashboard</a>
+    <h1>{{ job.name }}</h1>
+    {% if job.disc_label %}<div class="header-meta">Disc: {{ job.disc_label }}</div>{% endif %}
+  </div>
+  <div class="job-actions">
+    <span class="badge {{ job.status }}">{{ job.status | capitalize }}</span>
+    {% if job.status != 'complete' %}
+    <a href="/media/job/{{ job.id }}/export.json" class="btn btn-ghost">Export JSON</a>
+    {% endif %}
+    {% if classified_count == total_count and total_count > 0 and job.status == 'review' %}
+    <button class="btn btn-encode" onclick="approveAndEncode('{{ job.id }}')">
+      ✓ Approve &amp; Encode
+    </button>
+    <button class="btn btn-ghost" onclick="approveJob('{{ job.id }}')">
+      Approve Only
+    </button>
+    {% endif %}
+    {% if job.status == 'approved' %}
+    <button class="btn btn-encode" onclick="encodeJob('{{ job.id }}', event)">
+      ▶ Start Encode
+    </button>
+    {% endif %}
+  </div>
+</div>
+
+<!-- Progress bar -->
+{% if total_count > 0 %}
+<div class="progress-bar-wrap">
+  <div class="progress-bar-track">
+    <div class="progress-bar-fill" style="width:{{ ((classified_count / total_count) * 100)|int }}%"></div>
+  </div>
+  <span class="progress-label">{{ classified_count }}/{{ total_count }} classified</span>
+</div>
+{% endif %}
+
+{% if job.status == 'ingesting' %}
+<div class="notice ingesting">Disc is being ripped — page auto-refreshes every 5 seconds.</div>
+{% endif %}
+{% if job.status == 'encoding' %}
+<div class="notice encoding">HandBrake is encoding this job in the background. Check back later or watch <code>journalctl -u mediaintel -f</code> for progress.</div>
+{% endif %}
+
+{% if titles %}
+<div class="title-list">
+  {% for t in titles %}
+  <div class="title-card {% if t.classification %}classified{% endif %}"
+       id="title-card-{{ t.title_num }}">
+
+    <!-- Card header -->
+    <div class="title-card-header">
+      <div class="title-card-id">
+        <span class="title-num">Title {{ t.title_num }}</span>
+        <span class="title-meta">{{ t.duration_secs | duration }}</span>
+        <span class="title-meta">{{ t.filesize_bytes | filesize }}</span>
+      </div>
+      <!-- Flags -->
+      <div class="title-flags">
+        {% for flag in t.flags %}
+        <span class="flag flag-{{ flag }}">{{ flag | replace('_',' ') }}</span>
+        {% endfor %}
+      </div>
+    </div>
+
+    <!-- Screenshots -->
+    {% if t.screenshots %}
+    <div class="screenshot-strip">
+      {% for ss in t.screenshots %}
+      <img class="screenshot-thumb" src="/media/screenshots/{{ ss }}"
+           alt="screenshot" loading="lazy"
+           onclick="openLightbox(this.src)">
+      {% endfor %}
+    </div>
+    {% else %}
+    <div class="no-screenshots">No screenshots available</div>
+    {% endif %}
+
+    <!-- Current classification display -->
+    <div class="classification-display" id="cls-display-{{ t.title_num }}">
+      {% if t.classification %}
+        {% set cls = t.classification %}
+        {% if '_source' in cls and cls['_source'] == 'claude_auto' %}
+        <span class="auto-badge">⚡ Auto</span>
+        {% endif %}
+        <div class="cls-badge cls-{{ cls.type }}">
+          {{ cls.type | replace('_',' ') | title }}
+          {% if cls.type == 'tv_episode' and cls.show %}
+            — {{ cls.show }}
+            {% if cls.season %}S{{ '%02d'|format(cls.season|int) }}{% endif %}
+            {% if cls.episode %}E{{ '%02d'|format(cls.episode|int) }}{% endif %}
+            {% if cls.episode_title %}: {{ cls.episode_title }}{% endif %}
+          {% elif cls.type == 'movie' and cls.movie_title %}
+            — {{ cls.movie_title }}{% if cls.year %} ({{ cls.year }}){% endif %}
+          {% elif cls.type == 'special' and cls.title %}
+            — {{ cls.title }}
+          {% endif %}
+        </div>
+      {% else %}
+        <div class="cls-badge cls-unknown">Unclassified</div>
+      {% endif %}
+    </div>
+
+    <!-- Classification type buttons -->
+    {% if job.status not in ('approved','encoding','complete') %}
+    <div class="classify-buttons">
+      <button class="cls-btn cls-btn-tv"          onclick="showForm({{ t.title_num }}, 'tv_episode')">TV Episode</button>
+      <button class="cls-btn cls-btn-movie"        onclick="showForm({{ t.title_num }}, 'movie')">Movie</button>
+      <button class="cls-btn cls-btn-special"      onclick="showForm({{ t.title_num }}, 'special')">Special</button>
+      <button class="cls-btn cls-btn-documentary"  onclick="showForm({{ t.title_num }}, 'documentary')">Documentary</button>
+      <button class="cls-btn cls-btn-playall"      onclick="quickClassify({{ t.title_num }}, 'play_all')">Play-All</button>
+      <button class="cls-btn cls-btn-delete"       onclick="quickClassify({{ t.title_num }}, 'deleted')">Delete</button>
+      <button class="cls-btn cls-btn-unknown"      onclick="quickClassify({{ t.title_num }}, 'unknown')">Unknown</button>
+      <button class="cls-btn cls-btn-claude"       onclick="askClaude({{ t.title_num }})">
+        <span id="claude-spinner-{{ t.title_num }}" class="hidden">⟳</span>
+        Ask Claude
+      </button>
+    </div>
+
+    <!-- Inline classification form (hidden by default) -->
+    <div class="cls-form-wrap hidden" id="cls-form-{{ t.title_num }}">
+      <form class="cls-form" onsubmit="submitClassification(event, {{ t.title_num }})">
+        <input type="hidden" name="type" id="cls-type-{{ t.title_num }}">
+
+        <!-- TV Episode fields -->
+        <div class="form-group-set" id="fields-tv-{{ t.title_num }}" style="display:none">
+          <div class="form-row">
+            <div class="form-group">
+              <label>Show Name</label>
+              <input type="text" name="show" placeholder="Seinfeld">
+            </div>
+            <div class="form-group form-group-sm">
+              <label>Season</label>
+              <input type="number" name="season" min="1" max="99" placeholder="3">
+            </div>
+            <div class="form-group form-group-sm">
+              <label>Episode #</label>
+              <input type="number" name="episode" min="1" max="999" placeholder="11">
+            </div>
+          </div>
+          <div class="form-group">
+            <label>Episode Title <span class="optional">(optional)</span></label>
+            <input type="text" name="episode_title" placeholder="The Alternate Side">
+          </div>
+        </div>
+
+        <!-- Movie fields -->
+        <div class="form-group-set" id="fields-movie-{{ t.title_num }}" style="display:none">
+          <div class="form-row">
+            <div class="form-group">
+              <label>Movie Title</label>
+              <input type="text" name="movie_title" placeholder="A Few Good Men">
+            </div>
+            <div class="form-group form-group-sm">
+              <label>Year <span class="optional">(optional)</span></label>
+              <input type="number" name="year" min="1888" max="2100" placeholder="1992">
+            </div>
+          </div>
+        </div>
+
+        <!-- Special / Documentary fields -->
+        <div class="form-group-set" id="fields-special-{{ t.title_num }}" style="display:none">
+          <div class="form-group">
+            <label>Title / Description</label>
+            <input type="text" name="title" placeholder="Behind the Scenes">
+          </div>
+          <div class="form-group">
+            <label>Show / Series <span class="optional">(if applicable)</span></label>
+            <input type="text" name="show" placeholder="Seinfeld">
+          </div>
+        </div>
+
+        <div class="form-actions">
+          <button type="submit" class="btn btn-primary">Save</button>
+          <button type="button" class="btn btn-ghost" onclick="hideForm({{ t.title_num }})">Cancel</button>
+        </div>
+      </form>
+    </div>
+
+    <!-- Claude suggestion panel (hidden by default) -->
+    <div class="claude-panel hidden" id="claude-panel-{{ t.title_num }}">
+      <div class="claude-panel-header">Claude Suggestion</div>
+      <div class="claude-suggestion" id="claude-suggestion-{{ t.title_num }}"></div>
+      <div class="claude-actions">
+        <button class="btn btn-primary" onclick="applySuggestion({{ t.title_num }})">Apply</button>
+        <button class="btn btn-ghost" onclick="dismissClaude({{ t.title_num }})">Dismiss</button>
+      </div>
+    </div>
+    {% endif %}
+
+  </div>
+  {% endfor %}
+</div>
+{% else %}
+<div class="empty-state">
+  <p>No titles ripped yet. Check back shortly.</p>
+</div>
+{% endif %}
+
+<!-- Lightbox -->
+<div class="lightbox hidden" id="lightbox" onclick="closeLightbox()">
+  <img id="lightbox-img" src="" alt="">
+</div>
+
+<script>
+  const JOB_ID = '{{ job.id }}';
+</script>
+{% endblock %}

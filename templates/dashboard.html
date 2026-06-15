@@ -1,0 +1,141 @@
+{% extends "base.html" %}
+{% block title %}Dashboard — Media Intel{% endblock %}
+
+{% if active or encoding %}
+<meta http-equiv="refresh" content="5">
+{% endif %}
+
+{% block content %}
+<div class="page-header">
+  <div>
+    <h1>Ingestion Dashboard</h1>
+    <div class="header-meta">
+      {{ (active|length) + (review|length) + (approved|length) + (encoding|length) + (completed|length) }} disc{{ 's' if (active|length + review|length + approved|length + encoding|length + completed|length) != 1 else '' }}
+      &nbsp;·&nbsp;
+      {{ total_titles }} title{{ 's' if total_titles != 1 else '' }}
+    </div>
+  </div>
+  <a href="/media/rip" class="btn btn-primary">+ New Rip</a>
+</div>
+
+{% if active %}
+<section class="job-section">
+  <h2 class="section-title">
+    <span class="status-dot ingesting"></span>
+    Active Ingestion ({{ active|length }})
+  </h2>
+  <div class="job-grid">
+    {% for job in active %}
+    <a href="/media/job/{{ job.id }}" class="job-card ingesting">
+      <div class="job-card-name">{{ job.name }}</div>
+      <div class="job-card-meta">
+        <span class="badge ingesting">Ripping…</span>
+        <span>{{ job.title_count }} title{{ 's' if job.title_count != 1 else '' }}</span>
+      </div>
+      <div class="job-card-time">{{ job.created_at | reltime }}</div>
+    </a>
+    {% endfor %}
+  </div>
+</section>
+{% endif %}
+
+{% if review %}
+<section class="job-section">
+  <h2 class="section-title">
+    <span class="status-dot review"></span>
+    Needs Review ({{ review|length }})
+  </h2>
+  <div class="job-grid">
+    {% for job in review %}
+    <a href="/media/job/{{ job.id }}" class="job-card review">
+      <div class="job-card-name">{{ job.name }}</div>
+      <div class="job-card-meta">
+        <span class="badge review">Classify Titles</span>
+        <span>{{ job.title_count }} title{{ 's' if job.title_count != 1 else '' }}</span>
+      </div>
+      {% if job.disc_label %}
+      <div class="job-card-disc">{{ job.disc_label }}</div>
+      {% endif %}
+      <div class="job-card-time">{{ job.created_at | reltime }}</div>
+    </a>
+    {% endfor %}
+  </div>
+</section>
+{% endif %}
+
+{% if approved %}
+<section class="job-section">
+  <h2 class="section-title">
+    <span class="status-dot approved"></span>
+    Ready to Encode ({{ approved|length }})
+  </h2>
+  <div class="job-grid">
+    {% for job in approved %}
+    <div class="job-card approved job-card-with-action">
+      <a href="/media/job/{{ job.id }}" class="job-card-inner">
+        <div class="job-card-name">{{ job.name }}</div>
+        <div class="job-card-meta">
+          <span class="badge approved">Approved</span>
+          <span>{{ job.title_count }} title{{ 's' if job.title_count != 1 else '' }}</span>
+        </div>
+        <div class="job-card-time">{{ job.created_at | reltime }}</div>
+      </a>
+      <button class="btn btn-encode" onclick="encodeJob('{{ job.id }}', event)">
+        ▶ Encode
+      </button>
+    </div>
+    {% endfor %}
+  </div>
+</section>
+{% endif %}
+
+{% if encoding %}
+<section class="job-section">
+  <h2 class="section-title">
+    <span class="status-dot encoding"></span>
+    Encoding ({{ encoding|length }})
+  </h2>
+  <div class="job-grid">
+    {% for job in encoding %}
+    <a href="/media/job/{{ job.id }}" class="job-card encoding">
+      <div class="job-card-name">{{ job.name }}</div>
+      <div class="job-card-meta">
+        <span class="badge encoding">Encoding…</span>
+        <span>{{ job.title_count }} title{{ 's' if job.title_count != 1 else '' }}</span>
+      </div>
+      <div class="job-card-time">{{ job.created_at | reltime }}</div>
+    </a>
+    {% endfor %}
+  </div>
+</section>
+{% endif %}
+
+{% if completed %}
+<section class="job-section">
+  <h2 class="section-title">
+    <span class="status-dot complete"></span>
+    Completed ({{ completed|length }})
+  </h2>
+  <div class="job-grid">
+    {% for job in completed %}
+    <a href="/media/job/{{ job.id }}" class="job-card {{ job.status }}">
+      <div class="job-card-name">{{ job.name }}</div>
+      <div class="job-card-meta">
+        <span class="badge {{ job.status }}">{{ job.status | capitalize }}</span>
+        <span>{{ job.title_count }} title{{ 's' if job.title_count != 1 else '' }}</span>
+      </div>
+      <div class="job-card-time">{{ job.created_at | reltime }}</div>
+    </a>
+    {% endfor %}
+  </div>
+</section>
+{% endif %}
+
+{% if not active and not review and not approved and not encoding and not completed %}
+<div class="empty-state">
+  <div class="empty-icon">◈</div>
+  <h2>No ingestion jobs yet</h2>
+  <p>Run <code>riptv</code> in a terminal to start ripping a disc. Jobs appear here automatically.</p>
+</div>
+{% endif %}
+{% endblock %}

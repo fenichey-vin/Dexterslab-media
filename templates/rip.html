@@ -1,0 +1,344 @@
+{% extends "base.html" %}
+{% block title %}New Disc Rip — Media Intel{% endblock %}
+
+{% block content %}
+<div class="page-header">
+  <div>
+    <a href="/media/" class="back-link">← Dashboard</a>
+    <h1>New Disc Rip</h1>
+  </div>
+</div>
+
+<div style="max-width:760px">
+
+  <!-- Drive selector -->
+  <div style="margin-bottom:24px">
+    {% if drives|length == 0 %}
+    <div class="notice ingesting">
+      No optical drives detected (/dev/sr0 – /dev/sr3). Insert a disc and reload.
+    </div>
+    {% elif drives|length == 1 %}
+    <p style="color:var(--muted);font-size:0.9rem;margin-bottom:12px">
+      Drive: <strong style="color:var(--text)">{{ drives[0] }}</strong>
+    </p>
+    <input type="hidden" id="drive-select" value="{{ drives[0] }}">
+    {% else %}
+    <label style="display:block;font-size:0.8rem;font-weight:600;color:var(--muted);
+                  text-transform:uppercase;letter-spacing:0.04em;margin-bottom:6px">
+      Select Drive
+    </label>
+    <select id="drive-select"
+            style="background:var(--surface2);border:1px solid var(--border);
+                   border-radius:6px;padding:8px 12px;color:var(--text);
+                   font-size:0.9rem;outline:none;width:100%;max-width:320px">
+      {% for d in drives %}
+      <option value="{{ d }}">{{ d }}</option>
+      {% endfor %}
+    </select>
+    {% endif %}
+  </div>
+
+  <!-- Scan button -->
+  {% if drives|length > 0 %}
+  <button id="scan-btn" class="btn btn-primary" onclick="scanDisc()" style="margin-bottom:24px">
+    Scan Disc
+  </button>
+  {% endif %}
+
+  <!-- Loading state -->
+  <div id="scan-loading" class="scan-loading hidden">
+    <span class="spin">◌</span>
+    <span id="scan-loading-msg">Scanning disc… this takes about 30–60 seconds</span>
+  </div>
+
+  <!-- Results panel -->
+  <div id="results-panel" class="hidden">
+
+    <!-- Disc info -->
+    <section style="margin-bottom:24px">
+      <div style="font-size:0.78rem;font-weight:700;text-transform:uppercase;
+                  letter-spacing:0.06em;color:var(--muted);margin-bottom:4px">
+        Disc Detected
+      </div>
+      <div id="disc-label-display"
+           style="font-size:1.05rem;font-weight:600;margin-bottom:16px"></div>
+
+      <!-- Claude ID card (shown only when disc_id is returned) -->
+      <div id="disc-id-card" class="disc-id-card hidden">
+        <div class="disc-id-label">⚡ Claude Identification</div>
+        <div id="disc-id-text"></div>
+      </div>
+
+      <!-- Job name -->
+      <div style="margin-bottom:20px">
+        <label style="display:block;font-size:0.8rem;font-weight:600;color:var(--muted);
+                      text-transform:uppercase;letter-spacing:0.04em;margin-bottom:6px">
+          Job Name
+        </label>
+        <input id="job-name" type="text" placeholder="e.g. Seinfeld S03 Disc1"
+               style="background:var(--surface2);border:1px solid var(--border);
+                      border-radius:6px;padding:8px 12px;color:var(--text);
+                      font-size:0.95rem;outline:none;width:100%;max-width:420px;
+                      transition:border-color 0.15s"
+               onfocus="this.style.borderColor='var(--accent)'"
+               onblur="this.style.borderColor='var(--border)'"
+               oninput="updateRipCount()">
+      </div>
+    </section>
+
+    <!-- Title table -->
+    <section>
+      <h3 id="titles-summary"
+          style="font-size:0.95rem;font-weight:600;margin-bottom:12px;color:var(--muted)">
+        Titles
+      </h3>
+
+      <table class="rip-table" id="titles-table">
+        <thead>
+          <tr>
+            <th style="width:36px">
+              <input type="checkbox" id="check-all" title="Select all"
+                     onchange="toggleAll(this.checked)">
+            </th>
+            <th>#</th>
+            <th>Duration</th>
+            <th>Flags</th>
+          </tr>
+        </thead>
+        <tbody id="titles-tbody"></tbody>
+      </table>
+
+      <button id="start-btn" class="btn btn-primary" onclick="startRip()" disabled>
+        Start Ripping
+      </button>
+    </section>
+
+  </div><!-- /results-panel -->
+
+</div><!-- /max-width wrapper -->
+{% endblock %}
+
+{% block extra_js %}
+<script>
+'use strict';
+
+// Disc state populated after scan
+let _discTitles  = [];
+let _discId      = null;
+let _scanDone    = false;
+let _scanTimer   = null;
+
+function _getDrive() {
+  const el = document.getElementById('drive-select');
+  return el ? el.value : '';
+}
+
+function scanDisc() {
+  const drive = _getDrive();
+  if (!drive) { alert('No drive available.'); return; }
+
+  _scanDone = false;
+  document.getElementById('scan-btn').disabled = true;
+  document.getElementById('scan-loading').classList.remove('hidden');
+  document.getElementById('results-panel').classList.add('hidden');
+
+  // "Still scanning…" hint after 30 s
+  _scanTimer = setTimeout(() => {
+    const msg = document.getElementById('scan-loading-msg');
+    if (msg) msg.textContent = 'Still scanning… MakeMKV can take up to 2 minutes on some discs';
+  }, 30000);
+
+  fetch('/media/rip/scan', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ device: drive })
+  })
+  .then(r => r.json())
+  .then(data => {
+    clearTimeout(_scanTimer);
+    document.getElementById('scan-loading').classList.add('hidden');
+    document.getElementById('scan-btn').disabled = false;
+    _scanDone = true;
+
+    if (data.error) { alert('Scan error: ' + data.error); return; }
+
+    _discTitles = data.titles || [];
+    _discId     = data.disc_id || null;
+
+    // Disc label
+    document.getElementById('disc-label-display').textContent = data.disc_label || '';
+
+    // Job name pre-fill (cleaned disc label)
+    const clean = (data.disc_label || '')
+      .replace(/_/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    document.getElementById('job-name').value = clean;
+
+    // Claude ID card
+    const card = document.getElementById('disc-id-card');
+    const txt  = document.getElementById('disc-id-text');
+    if (_discId) {
+      txt.innerHTML = _formatDiscId(_discId);
+      card.classList.remove('hidden');
+
+      // Pre-fill job name from Claude suggestion when available
+      if (_discId.type === 'tv' && _discId.show) {
+        const season = _discId.season ? ` S${String(_discId.season).padStart(2,'0')}` : '';
+        document.getElementById('job-name').value = _discId.show + season;
+      } else if (_discId.type === 'movie' && _discId.title) {
+        const yr = _discId.year ? ` (${_discId.year})` : '';
+        document.getElementById('job-name').value = _discId.title + yr;
+      }
+    } else {
+      card.classList.add('hidden');
+    }
+
+    // Build titles table
+    _buildTitlesTable(_discTitles);
+    document.getElementById('results-panel').classList.remove('hidden');
+    updateRipCount();
+  })
+  .catch(e => {
+    clearTimeout(_scanTimer);
+    document.getElementById('scan-loading').classList.add('hidden');
+    document.getElementById('scan-btn').disabled = false;
+    alert('Network error during scan: ' + e);
+  });
+}
+
+function _formatDiscId(d) {
+  if (!d) return '';
+  if (d.type === 'tv') {
+    const epCount = (d.episodes || []).length;
+    const season  = d.season ? ` · Season ${d.season}` : '';
+    const eps     = epCount ? ` · ${epCount} episode${epCount !== 1 ? 's' : ''} detected` : '';
+    return `<strong>${d.show || '?'}</strong>${season}${eps}`;
+  }
+  if (d.type === 'movie') {
+    const yr  = d.year  ? ` (${d.year})`           : '';
+    const mt  = d.main_title ? ` · Main feature on title ${d.main_title}` : '';
+    return `<strong>${d.title || '?'}</strong>${yr}${mt}`;
+  }
+  return JSON.stringify(d);
+}
+
+function _buildTitlesTable(titles) {
+  const tbody = document.getElementById('titles-tbody');
+  tbody.innerHTML = '';
+
+  titles.forEach(t => {
+    const isPlayAll = (t.flags || []).includes('play_all');
+    const checked   = !isPlayAll;  // play_all unchecked by default
+
+    const flagsHtml = (t.flags || []).map(f =>
+      `<span class="flag flag-${f}">${f.replace(/_/g,' ')}</span>`
+    ).join('');
+
+    const tr = document.createElement('tr');
+    if (isPlayAll) tr.classList.add('rip-skipped');
+    tr.innerHTML = `
+      <td><input type="checkbox" class="title-check" data-num="${t.num}"
+                 ${checked ? 'checked' : ''} onchange="updateRipCount()"></td>
+      <td>${t.num}</td>
+      <td style="font-variant-numeric:tabular-nums">${t.dur_str}</td>
+      <td><div class="flag-cell">${flagsHtml || '<span style="color:var(--muted);font-size:0.8rem">—</span>'}</div></td>
+    `;
+    tbody.appendChild(tr);
+  });
+
+  // Sync "check all" state
+  document.getElementById('check-all').checked =
+    titles.length > 0 && titles.every(t => !(t.flags||[]).includes('play_all'));
+}
+
+function toggleAll(checked) {
+  document.querySelectorAll('.title-check').forEach(cb => { cb.checked = checked; });
+  // Update row opacity
+  document.querySelectorAll('#titles-tbody tr').forEach(tr => {
+    const cb = tr.querySelector('.title-check');
+    if (cb && !cb.checked) tr.classList.add('rip-skipped');
+    else tr.classList.remove('rip-skipped');
+  });
+  updateRipCount();
+}
+
+function updateRipCount() {
+  const allChecks = document.querySelectorAll('.title-check');
+  const checked   = [...allChecks].filter(c => c.checked);
+  const total     = allChecks.length;
+  const skipped   = total - checked.length;
+
+  // Update row opacity for individually toggled rows
+  document.querySelectorAll('#titles-tbody tr').forEach(tr => {
+    const cb = tr.querySelector('.title-check');
+    if (cb) {
+      if (cb.checked) tr.classList.remove('rip-skipped');
+      else tr.classList.add('rip-skipped');
+    }
+  });
+
+  const summary = document.getElementById('titles-summary');
+  if (summary) {
+    summary.textContent =
+      `Titles (${total} total — ${checked.length} will be ripped` +
+      (skipped ? `, ${skipped} skipped` : '') + ')';
+  }
+
+  const startBtn = document.getElementById('start-btn');
+  if (startBtn) {
+    startBtn.disabled = checked.length === 0;
+    startBtn.textContent = `Start Ripping ${checked.length} Title${checked.length !== 1 ? 's' : ''}`;
+  }
+
+  // Keep check-all in sync
+  const checkAll = document.getElementById('check-all');
+  if (checkAll) {
+    checkAll.checked = allChecks.length > 0 && checked.length === allChecks.length;
+    checkAll.indeterminate = checked.length > 0 && checked.length < allChecks.length;
+  }
+}
+
+function startRip() {
+  const jobName = (document.getElementById('job-name').value || '').trim();
+  if (!jobName) { alert('Please enter a job name.'); return; }
+
+  const titleNums = [...document.querySelectorAll('.title-check')]
+    .filter(c => c.checked)
+    .map(c => parseInt(c.dataset.num, 10));
+
+  if (!titleNums.length) { alert('No titles selected.'); return; }
+
+  const drive = _getDrive();
+  const btn   = document.getElementById('start-btn');
+  btn.disabled    = true;
+  btn.textContent = 'Starting…';
+
+  fetch('/media/rip/start', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      job_name:   jobName,
+      device:     drive,
+      title_nums: titleNums,
+      disc_id:    _discId
+    })
+  })
+  .then(r => r.json())
+  .then(data => {
+    if (data.ok) {
+      window.location.href = '/media/';
+    } else {
+      btn.disabled = false;
+      updateRipCount();
+      alert('Error: ' + (data.error || 'unknown'));
+    }
+  })
+  .catch(e => {
+    btn.disabled = false;
+    updateRipCount();
+    alert('Network error: ' + e);
+  });
+}
+</script>
+{% endblock %}

@@ -1,0 +1,20 @@
+[Unit]
+Description=Media Intel Dashboard
+After=network.target
+
+[Service]
+Type=simple
+User=vinnie
+WorkingDirectory=/home/vinnie/mediaintel
+ExecStart=/usr/bin/python3 /home/vinnie/mediaintel/app.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+Environment=PYTHONUNBUFFERED=1
+
+# Optional: set Anthropic API key here
+# Environment=ANTHROPIC_API_KEY=sk-ant-...
+
+[Install]
+WantedBy=multi-user.target

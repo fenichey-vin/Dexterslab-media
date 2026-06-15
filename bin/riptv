@@ -1,0 +1,410 @@
+#!/usr/bin/env python3
+"""
+riptv — Universal disc ingestor for the Media Intel pipeline.
+
+Rips DVD titles to /srv/media/review/<job-id>/ without assigning episode
+numbers or show metadata. Every title is raw until reviewed in the dashboard.
+"""
+
+import os
+import sys
+import re
+import json
+import subprocess
+import sqlite3
+from pathlib import Path
+from datetime import datetime, timezone
+
+sys.path.insert(0, '/home/vinnie/mediaintel')
+from config import REVIEW_DIR, DB_PATH, PORT
+
+DASHBOARD_URL = f'http://dexterslab:{PORT}/media'
+
+
+# ── DB helpers (direct SQLite — works even if web app is down) ─────────────────
+
+def _db():
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.execute('PRAGMA journal_mode = WAL')
+    conn.execute('PRAGMA foreign_keys = ON')
+    conn.execute('''CREATE TABLE IF NOT EXISTS jobs (
+        id TEXT PRIMARY KEY, name TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'ingesting',
+        disc_label TEXT, drive TEXT, review_path TEXT NOT NULL,
+        title_count INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL, notes TEXT)''')
+    conn.execute('''CREATE TABLE IF NOT EXISTS titles (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT NOT NULL,
+        title_num INTEGER NOT NULL, filepath TEXT NOT NULL,
+        duration_secs REAL, filesize_bytes INTEGER,
+        screenshots TEXT NOT NULL DEFAULT '[]',
+        flags TEXT NOT NULL DEFAULT '[]',
+        classification TEXT, classified_at TEXT,
+        UNIQUE(job_id, title_num))''')
+    conn.commit()
+    return conn
+
+
+def _now():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def db_create_job(conn, job_id, name, review_path, drive, disc_label):
+    now = _now()
+    conn.execute(
+        '''INSERT OR IGNORE INTO jobs
+           (id, name, status, disc_label, drive, review_path, title_count, created_at, updated_at)
+           VALUES (?,?,?,?,?,?,0,?,?)''',
+        (job_id, name, 'ingesting', disc_label, drive, str(review_path), now, now)
+    )
+    conn.commit()
+
+
+def db_add_title(conn, job_id, title_num, filepath,
+                 duration_secs, filesize_bytes, screenshots, flags):
+    conn.execute(
+        '''INSERT OR REPLACE INTO titles
+           (job_id, title_num, filepath, duration_secs, filesize_bytes, screenshots, flags)
+           VALUES (?,?,?,?,?,?,?)''',
+        (job_id, title_num, str(filepath), duration_secs, filesize_bytes,
+         json.dumps(screenshots), json.dumps(flags))
+    )
+    conn.execute(
+        'UPDATE jobs SET title_count=title_count+1, updated_at=? WHERE id=?',
+        (_now(), job_id)
+    )
+    conn.commit()
+
+
+def db_set_status(conn, job_id, status):
+    conn.execute('UPDATE jobs SET status=?, updated_at=? WHERE id=?',
+                 (status, _now(), job_id))
+    conn.commit()
+
+
+# ── MakeMKV parsing ────────────────────────────────────────────────────────────
+
+def scan_disc(device):
+    """Run makemkvcon in robot mode and return (titles, disc_label)."""
+    print(f'\n=== Scanning disc on {device} ===\n')
+    result = subprocess.run(
+        ['makemkvcon', '-r', 'info', f'dev:{device}'],
+        capture_output=True, text=True
+    )
+    return parse_makemkv_output(result.stdout + result.stderr)
+
+
+def parse_makemkv_output(output):
+    titles     = {}
+    disc_label = 'Unknown Disc'
+
+    for line in output.splitlines():
+        # Disc label from DRV line
+        m = re.match(r'^DRV:\d+,\d+,\d+,\d+,\d+,"[^"]*","([^"]+)"', line)
+        if m and m.group(1).strip():
+            disc_label = m.group(1).strip()
+            continue
+
+        # Disc label from CINFO (type 2 = label)
+        m = re.match(r'^CINFO:2,0,"([^"]+)"', line)
+        if m and m.group(1).strip() not in ('', 'DVD', 'DVD_VIDEO'):
+            disc_label = m.group(1).strip()
+            continue
+
+        # Title attributes
+        m = re.match(r'^TINFO:(\d+),(\d+),(\d+),"(.*)"$', line)
+        if m:
+            tnum = int(m.group(1))
+            attr = int(m.group(2))
+            val  = m.group(4)
+            if tnum not in titles:
+                titles[tnum] = {}
+            titles[tnum][attr] = val
+
+    result = []
+    for tnum in sorted(titles.keys()):
+        attrs = titles[tnum]
+
+        # Duration: find any attr value matching H:MM:SS
+        dur_str  = None
+        dur_secs = 0
+        for val in attrs.values():
+            mm = re.match(r'^(\d+):(\d{2}):(\d{2})$', val)
+            if mm:
+                h, m_, s = int(mm.group(1)), int(mm.group(2)), int(mm.group(3))
+                dur_secs = h * 3600 + m_ * 60 + s
+                dur_str  = val
+                break
+
+        result.append({
+            'num':       tnum,
+            'dur_str':   dur_str or '?:??:??',
+            'dur_secs':  dur_secs,
+            'flags':     [],
+        })
+
+    return result, disc_label
+
+
+def flag_titles(titles):
+    """Add play_all / short / duplicate flags."""
+    valid = [t['dur_secs'] for t in titles if t['dur_secs'] > 0]
+    if not valid:
+        return titles
+
+    median = sorted(valid)[len(valid) // 2]
+
+    for t in titles:
+        d = t['dur_secs']
+        flags = []
+
+        # Play-All: > 1.5× median and > 20 min
+        if d > 1.5 * median and d > 1200:
+            flags.append('play_all')
+
+        # Short: < 15 minutes (likely bonus/trailer)
+        if 0 < d < 900:
+            flags.append('short')
+
+        if d == 0:
+            flags.append('no_duration')
+
+        # Near-duplicate duration
+        dupes = sum(1 for t2 in titles if t2['num'] != t['num'] and abs(t2['dur_secs'] - d) < 30)
+        if dupes:
+            flags.append('possible_duplicate')
+
+        t['flags'] = flags
+    return titles
+
+
+# ── Ripping ────────────────────────────────────────────────────────────────────
+
+def rip_title(device, title_num, output_dir):
+    """Run makemkvcon to rip a single title. Returns path to MKV or None."""
+    print(f'  Ripping title {title_num}…')
+    result = subprocess.run(
+        ['makemkvcon', 'mkv', f'dev:{device}', str(title_num), str(output_dir)],
+        capture_output=False
+    )
+    if result.returncode != 0:
+        print(f'  ERROR: makemkvcon exited {result.returncode}')
+        return None
+
+    mkv_files = sorted(output_dir.glob('*.mkv'))
+    if not mkv_files:
+        print('  ERROR: No MKV produced.')
+        return None
+
+    return mkv_files[0]
+
+
+# ── Post-processing ─────────────────────────────────────────────────────────────
+
+def get_duration(mkv_path):
+    """ffprobe-measured duration in seconds (float)."""
+    r = subprocess.run(
+        ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+         '-of', 'csv=p=0', str(mkv_path)],
+        capture_output=True, text=True
+    )
+    try:
+        return float(r.stdout.strip())
+    except (ValueError, AttributeError):
+        return 0.0
+
+
+def take_screenshots(mkv_path, output_dir, duration_secs):
+    """Generate up to 3 screenshots. Returns list of relative paths for DB."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    timestamps = [120, 480, 900]  # 2m, 8m, 15m
+    paths = []
+
+    for ts in timestamps:
+        if duration_secs and ts >= duration_secs * 0.9:
+            break
+        out = output_dir / f'thumb_{ts}.jpg'
+        r = subprocess.run(
+            ['ffmpeg', '-y', '-ss', str(ts), '-i', str(mkv_path),
+             '-frames:v', '1', '-q:v', '2', str(out)],
+            capture_output=True
+        )
+        if r.returncode == 0 and out.exists():
+            # Store path relative to REVIEW_DIR so the web app can serve it
+            paths.append(str(out.relative_to(REVIEW_DIR)))
+
+    return paths
+
+
+# ── Drive detection ────────────────────────────────────────────────────────────
+
+def choose_drive():
+    candidates = [Path(f'/dev/sr{i}') for i in range(4) if Path(f'/dev/sr{i}').exists()]
+    if not candidates:
+        print('No optical drives found (/dev/sr0 – /dev/sr3).')
+        manual = input('Enter drive path manually (or blank to abort): ').strip()
+        return manual or None
+
+    if len(candidates) == 1:
+        print(f'Found drive: {candidates[0]}')
+        return str(candidates[0])
+
+    print('Multiple drives detected:')
+    for i, d in enumerate(candidates):
+        print(f'  {i}) {d}')
+    choice = input(f'Select drive [0]: ').strip() or '0'
+    try:
+        return str(candidates[int(choice)])
+    except (IndexError, ValueError):
+        return str(candidates[0])
+
+
+# ── Main ───────────────────────────────────────────────────────────────────────
+
+def main():
+    print('╔══════════════════════════════════════╗')
+    print('║   Media Intel — riptv Ingestor       ║')
+    print('╚══════════════════════════════════════╝\n')
+
+    # Job metadata (hint — no strict accuracy required)
+    job_name  = input('Job name (e.g. "Seinfeld S03 Disc3"): ').strip()
+    if not job_name:
+        print('Aborted.')
+        return
+
+    device = choose_drive()
+    if not device:
+        print('No drive selected. Aborted.')
+        return
+
+    # Sanitize job name into a valid directory component
+    safe_name = re.sub(r'[^\w\s-]', '', job_name).strip()
+    safe_name = re.sub(r'[\s]+', '-', safe_name)
+    timestamp = datetime.now().strftime('%Y%m%d%H%M%S')
+    job_id    = f'{safe_name}-{timestamp}'
+    job_dir   = REVIEW_DIR / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f'\nJob directory: {job_dir}')
+
+    # ── Scan disc ──────────────────────────────────────────────────────────────
+    titles, disc_label = scan_disc(device)
+
+    if not titles:
+        print('\nNo titles found on disc. Check that a disc is inserted.')
+        return
+
+    # Flag anomalies
+    titles = flag_titles(titles)
+
+    # ── Display title list ─────────────────────────────────────────────────────
+    print(f'\nDisc: {disc_label}')
+    print(f'Found {len(titles)} title(s):\n')
+    print(f'  {"#":<5} {"Duration":<12} {"Flags"}')
+    print(f'  {"─"*5} {"─"*12} {"─"*30}')
+    for t in titles:
+        flag_str = ', '.join(t['flags']) if t['flags'] else ''
+        warn     = '  ⚠ ' if t['flags'] else '    '
+        print(f'{warn}{t["num"]:<5} {t["dur_str"]:<12} {flag_str}')
+
+    print()
+    print('Enter title numbers to rip (space-separated).')
+    print('Example: 1 2 3 4   or   all   to rip everything')
+    selection = input('Titles: ').strip()
+
+    if not selection:
+        print('Nothing selected. Aborted.')
+        return
+
+    if selection.lower() == 'all':
+        selected_nums = [t['num'] for t in titles]
+    else:
+        try:
+            selected_nums = [int(x) for x in selection.split()]
+        except ValueError:
+            print('Invalid selection.')
+            return
+
+    # Build lookup
+    title_map = {t['num']: t for t in titles}
+    selected  = [title_map[n] for n in selected_nums if n in title_map]
+
+    if not selected:
+        print('No valid titles selected.')
+        return
+
+    # Skip play-all and short unless confirmed
+    suspicious = [t for t in selected if 'play_all' in t['flags']]
+    if suspicious:
+        print(f'\n⚠  {len(suspicious)} suspected Play-All title(s) selected:')
+        for t in suspicious:
+            print(f'   Title {t["num"]} — {t["dur_str"]}')
+        confirm = input('Include anyway? (y/N): ').strip().lower()
+        if confirm != 'y':
+            selected = [t for t in selected if 'play_all' not in t['flags']]
+            print('Play-All titles excluded.')
+
+    print(f'\nWill rip {len(selected)} title(s): {[t["num"] for t in selected]}\n')
+
+    # ── Register job in DB ─────────────────────────────────────────────────────
+    conn = _db()
+    db_create_job(conn, job_id, job_name, job_dir, device, disc_label)
+    print(f'Job registered: {job_id}')
+    print(f'Dashboard: {DASHBOARD_URL}/job/{job_id}\n')
+
+    # ── Rip each title ─────────────────────────────────────────────────────────
+    success_count = 0
+    for t in selected:
+        title_dir = job_dir / f'title_{t["num"]}'
+        title_dir.mkdir(parents=True, exist_ok=True)
+        ss_dir    = title_dir / 'screenshots'
+
+        print(f'\n── Title {t["num"]} ─────────────────────────────────────')
+        mkv_path = rip_title(device, t['num'], title_dir)
+
+        if not mkv_path:
+            print(f'  Skipping title {t["num"]} (rip failed).')
+            continue
+
+        # Accurate duration from ffprobe
+        duration = get_duration(mkv_path)
+        if duration == 0.0 and t['dur_secs']:
+            duration = float(t['dur_secs'])
+
+        filesize    = mkv_path.stat().st_size
+        screenshots = take_screenshots(mkv_path, ss_dir, duration)
+
+        # Recompute flags with accurate duration
+        single = dict(t, dur_secs=duration, flags=[])
+        single = flag_titles([single])[0]
+        final_flags = single['flags']
+
+        # Store relative path to MKV for web app
+        rel_mkv = str(mkv_path.relative_to(REVIEW_DIR))
+
+        db_add_title(conn, job_id, t['num'], rel_mkv,
+                     duration, filesize, screenshots, final_flags)
+
+        dur_h, rem  = divmod(int(duration), 3600)
+        dur_m, dur_s = divmod(rem, 60)
+        print(f'  ✓ Duration: {dur_h}:{dur_m:02d}:{dur_s:02d}')
+        print(f'  ✓ Size:     {filesize / (1024**3):.2f} GB')
+        print(f'  ✓ Screenshots: {len(screenshots)}')
+        print(f'  ✓ Flags: {", ".join(final_flags) or "none"}')
+        success_count += 1
+
+    # ── Finalise ───────────────────────────────────────────────────────────────
+    db_set_status(conn, job_id, 'review')
+    conn.close()
+
+    print(f'\n{"═"*50}')
+    print(f'Ripping complete: {success_count}/{len(selected)} titles')
+    print(f'Job status: review')
+    print(f'\n➜  Review at: {DASHBOARD_URL}/job/{job_id}')
+    print(f'{"═"*50}\n')
+
+    # Eject disc
+    subprocess.run(['eject', device], capture_output=True)
+
+
+if __name__ == '__main__':
+    main()
