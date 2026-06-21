@@ -6,6 +6,9 @@ the web-driven workflow produces the same results as the terminal workflow.
 """
 
 import re
+import sqlite3
+import json
+import time
 import subprocess
 from pathlib import Path
 
@@ -195,22 +198,78 @@ def flag_titles(titles):
 
 # ── Ripping ──────────────────────────────────────────────────────────────────
 
-def rip_title(device, title_num, output_dir):
+def _write_rip_progress(job_id, title_num, pct, op):
+    try:
+        from config import DB_PATH
+        data = json.dumps({'title_num': title_num, 'pct': pct, 'op': op, 'ts': time.time()})
+        c = sqlite3.connect(str(DB_PATH))
+        c.execute('PRAGMA journal_mode = WAL')
+        c.execute('UPDATE jobs SET rip_progress=? WHERE id=?', (data, job_id))
+        c.commit()
+        c.close()
+    except Exception:
+        pass
+
+
+def _clear_rip_progress(job_id):
+    try:
+        from config import DB_PATH
+        c = sqlite3.connect(str(DB_PATH))
+        c.execute('PRAGMA journal_mode = WAL')
+        c.execute('UPDATE jobs SET rip_progress=NULL WHERE id=?', (job_id,))
+        c.commit()
+        c.close()
+    except Exception:
+        pass
+
+
+def rip_title(device, title_num, output_dir, job_id=None):
     """Run makemkvcon to rip a single title.
 
     output_dir should be a Path.  Returns Path to the produced MKV, or None
-    on failure.
+    on failure.  Pass job_id to enable live progress tracking in the dashboard.
     """
     output_dir = Path(output_dir)
-    result = subprocess.run(
-        ['makemkvcon', 'mkv', f'dev:{device}', str(title_num), str(output_dir)],
-        capture_output=False
+
+    proc = subprocess.Popen(
+        ['makemkvcon', '-r', 'mkv', f'dev:{device}', str(title_num), str(output_dir)],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, bufsize=1
     )
-    if result.returncode != 0:
+
+    last_write = 0.0
+    pct = 0
+    op  = ''
+
+    for raw in proc.stdout:
+        line = raw.rstrip()
+
+        m = re.match(r'^PRGV:(\d+),\d+,(\d+)', line)
+        if m:
+            cur, mx = int(m.group(1)), int(m.group(2))
+            pct = int(cur * 100 / mx) if mx else 0
+            if job_id:
+                now = time.time()
+                if now - last_write >= 3:
+                    _write_rip_progress(job_id, title_num, pct, op)
+                    last_write = now
+            continue
+
+        m = re.match(r'^PRG[CT]:\d+,\d+,"([^"]*)"', line)
+        if m:
+            op = m.group(1)
+
+    proc.wait()
+
+    if proc.returncode != 0:
+        if job_id:
+            _clear_rip_progress(job_id)
         return None
 
     mkv_files = sorted(output_dir.glob('*.mkv'))
     if not mkv_files:
+        if job_id:
+            _clear_rip_progress(job_id)
         return None
 
     return mkv_files[0]

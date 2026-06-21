@@ -728,9 +728,14 @@ def _rip_disc_bg(job_id, device, title_nums, disc_context):
                 title_dir = job_dir / f'title_{title_num}'
                 title_dir.mkdir(parents=True, exist_ok=True)
 
-                mkv = rip_title(device, title_num, title_dir)
+                mkv = rip_title(device, title_num, title_dir, job_id=job_id)
                 if mkv is None:
                     continue
+
+                db.set_rip_progress(job_id, {
+                    'title_num': title_num, 'pct': 100,
+                    'op': 'Post-processing…', 'ts': time.time()
+                })
 
                 duration    = get_duration(mkv)
                 single      = flag_titles([{'num': title_num, 'dur_secs': duration, 'flags': []}])
@@ -739,6 +744,7 @@ def _rip_disc_bg(job_id, device, title_nums, disc_context):
                 rel_mkv = str(mkv.relative_to(REVIEW_DIR))
                 db.add_title(job_id, title_num, rel_mkv,
                              duration, mkv.stat().st_size, [], final_flags)
+                db.set_rip_progress(job_id, None)
                 ripped.append((title_num, mkv, duration))
 
             except Exception:
