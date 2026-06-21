@@ -14,23 +14,66 @@ from pathlib import Path
 
 
 def detect_drives():
-    """Return list of /dev/sr* device paths that currently exist."""
-    return [str(Path(f'/dev/sr{i}')) for i in range(4)
-            if Path(f'/dev/sr{i}').exists()]
+    """Return list of dicts for each /dev/srN that exists.
+
+    Each dict has:
+      device    — '/dev/srN'
+      has_media — True if a disc is currently in the drive
+                  (read from /sys/block/srN/size; 0 = no disc)
+    Drives with media sort first so the dropdown defaults to the right one.
+    """
+    drives = []
+    for i in range(4):
+        p = Path(f'/dev/sr{i}')
+        if not p.exists():
+            continue
+        try:
+            has_media = int(Path(f'/sys/block/sr{i}/size').read_text().strip()) > 0
+        except Exception:
+            has_media = False
+        drives.append({'device': str(p), 'has_media': has_media})
+    drives.sort(key=lambda d: (0 if d['has_media'] else 1))
+    return drives
 
 
 # ── MakeMKV parsing ──────────────────────────────────────────────────────────
 
 def scan_disc(device):
-    """Run makemkvcon in robot mode and return (titles, disc_label).
+    """Run makemkvcon and return (titles, disc_label).
 
-    Matches the parse logic in riptv exactly.
+    Tries robot mode first for structured output; if that yields 0 titles
+    (common with region-mismatched DVDs), falls back to human-readable mode
+    which uses a different code path that handles the region workaround more
+    reliably.
     """
     result = subprocess.run(
         ['makemkvcon', '-r', 'info', f'dev:{device}'],
         capture_output=True, text=True
     )
-    return _parse_makemkv_output(result.stdout + result.stderr)
+    titles, disc_label = _parse_makemkv_output(result.stdout + result.stderr)
+
+    if not titles:
+        # Robot mode produced nothing — try without -r
+        result2 = subprocess.run(
+            ['makemkvcon', 'info', f'dev:{device}'],
+            capture_output=True, text=True
+        )
+        titles = _parse_plain_output(result2.stdout + result2.stderr)
+
+    # Last-resort label via blkid if robot mode never gave us one
+    if disc_label == 'Unknown Disc':
+        try:
+            r = subprocess.run(
+                ['blkid', device, '-o', 'value', '-s', 'LABEL'],
+                capture_output=True, text=True
+            )
+            label = r.stdout.strip()
+            if label:
+                disc_label = label
+        except Exception:
+            pass
+
+    return titles, disc_label
 
 
 def _parse_makemkv_output(output):
@@ -38,8 +81,8 @@ def _parse_makemkv_output(output):
     disc_label = 'Unknown Disc'
 
     for line in output.splitlines():
-        # Disc label from DRV line
-        m = re.match(r'^DRV:\d+,\d+,\d+,\d+,\d+,"[^"]*","([^"]+)"', line)
+        # Disc label from DRV line (format: DRV:idx,status,flags,drives,"drive","label","path")
+        m = re.match(r'^DRV:\d+,\d+,\d+,\d+,"[^"]*","([^"]+)"', line)
         if m and m.group(1).strip():
             disc_label = m.group(1).strip()
             continue
@@ -83,6 +126,30 @@ def _parse_makemkv_output(output):
         })
 
     return result, disc_label
+
+
+def _parse_plain_output(output):
+    """Parse human-readable makemkvcon output (no -r flag).
+
+    Extracts titles from lines like:
+      Title #1 was added (39 cell(s), 2:06:34)
+
+    MakeMKV reports title numbers 1-indexed in human mode but indexes them
+    0-based in the TINFO/rip commands, so we subtract 1 to stay consistent.
+    """
+    result = []
+    for line in output.splitlines():
+        m = re.match(r'^Title #(\d+) was added \(.*?(\d+:\d{2}:\d{2})\)', line)
+        if m:
+            tnum = int(m.group(1)) - 1   # convert to 0-indexed
+            h, mi, s = (int(x) for x in m.group(2).split(':'))
+            result.append({
+                'num':      tnum,
+                'dur_str':  m.group(2),
+                'dur_secs': h * 3600 + mi * 60 + s,
+                'flags':    [],
+            })
+    return result
 
 
 # ── Flagging ─────────────────────────────────────────────────────────────────
@@ -165,21 +232,31 @@ def get_duration(mkv_path):
 
 
 def take_screenshots(mkv_path, output_dir, duration_secs):
-    """Generate up to 3 screenshots at 2m / 8m / 15m.
+    """Generate 5 screenshots evenly distributed across the episode.
 
-    Returns a list of path strings relative to REVIEW_DIR, suitable for
-    storing in the DB and serving via the web app.
+    Timestamps are spread from 10% to 90% of duration so we sample the
+    whole episode rather than just the first 15 minutes. This gives Claude
+    much better coverage for episode identification.
+
+    Returns a list of path strings relative to REVIEW_DIR.
     """
     from config import REVIEW_DIR  # lazy import — avoids circular deps
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    timestamps = [120, 480, 900]  # 2m, 8m, 15m
     paths = []
 
+    if not duration_secs or duration_secs < 60:
+        return paths
+
+    # 5 evenly-spaced samples from 10% to 90% of the runtime
+    count = 5
+    timestamps = [
+        int(duration_secs * (i + 1) / (count + 1))
+        for i in range(count)
+    ]
+
     for ts in timestamps:
-        if duration_secs and ts >= duration_secs * 0.9:
-            break
         out = output_dir / f'thumb_{ts}.jpg'
         r = subprocess.run(
             ['ffmpeg', '-y', '-ss', str(ts), '-i', str(mkv_path),

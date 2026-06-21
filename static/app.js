@@ -37,9 +37,19 @@ function showForm(n, type) {
   show(wrap);
   hide(qs(`claude-panel-${n}`));
 
-  // Pre-fill if a Claude suggestion exists
+  // Scope prefill to the active fieldset only — multiple fieldsets share the
+  // same input names (e.g. both TV and Special have name="show"), so querying
+  // the whole form returns the first match, which is always the TV fieldset.
+  const activeFieldset = qs(`fields-${sets[type]}-${n}`);
   const sugg = (_state[n] || {}).claudeSuggestion;
-  if (sugg && sugg.type === type) _prefillForm(n, sugg);
+  if (sugg && sugg.type === type) {
+    _prefillForm(activeFieldset, sugg);
+  } else {
+    const existingRaw = wrap && wrap.dataset.cls;
+    if (existingRaw) {
+      try { _prefillForm(activeFieldset, JSON.parse(existingRaw)); } catch(e) {}
+    }
+  }
 
   wrap.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
 }
@@ -48,12 +58,19 @@ function hideForm(n) {
   hide(qs(`cls-form-${n}`));
 }
 
-function _prefillForm(n, data) {
-  const form = qs(`cls-form-${n}`) && qs(`cls-form-${n}`).querySelector('form');
-  if (!form) return;
-  const set = f => { const el = form.querySelector(`[name="${f}"]`); if (el && data[f] != null) el.value = data[f]; };
+function _prefillForm(container, data) {
+  if (!container) return;
+  const set = f => { const el = container.querySelector(`[name="${f}"]`); if (el && data[f] != null) el.value = data[f]; };
   set('show'); set('season'); set('episode'); set('episode_title');
   set('movie_title'); set('year'); set('title');
+
+  // For specials saved before 'show' was included: derive it from the title
+  // by stripping the trailing "- Special Features N" suffix.
+  const showEl = container.querySelector('[name="show"]');
+  if (showEl && !showEl.value && data.title) {
+    const m = data.title.match(/^(.+?)\s*-\s*Special Features\s*\d*\s*$/i);
+    if (m) showEl.value = m[1].trim();
+  }
 }
 
 function submitClassification(event, n) {
@@ -79,6 +96,8 @@ function submitClassification(event, n) {
         _updateDisplay(n, data);
         hideForm(n);
         _updateProgress();
+        const wrap = qs(`cls-form-${n}`);
+        if (wrap) wrap.dataset.cls = JSON.stringify(data);
       } else {
         alert('Save failed: ' + (r.error || 'unknown error'));
       }

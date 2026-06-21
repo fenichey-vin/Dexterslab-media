@@ -30,6 +30,11 @@
       ▶ Start Encode
     </button>
     {% endif %}
+    {% if job.status == 'staged' %}
+    <button class="btn btn-commit" onclick="commitAll('{{ job.id }}')">
+      ✓ Commit All to Library
+    </button>
+    {% endif %}
   </div>
 </div>
 
@@ -48,6 +53,111 @@
 {% endif %}
 {% if job.status == 'encoding' %}
 <div class="notice encoding">HandBrake is encoding this job in the background. Check back later or watch <code>journalctl -u mediaintel -f</code> for progress.</div>
+{% endif %}
+{% if job.status == 'staged' %}
+<div class="notice staged">Encoded files are in <code>/srv/media/staging/</code> — watch them in Jellyfin, fix any classifications below, then click <strong>Move to Library</strong> on each title or <strong>Commit All</strong> to file them all at once.</div>
+{% endif %}
+
+{% if job.status == 'review' %}
+<!-- Disc Context Panel -->
+<div style="background:var(--surface2);border:1px solid var(--border);border-radius:8px;
+            padding:16px;margin-bottom:24px">
+  <div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:12px">
+    <div style="flex:1;min-width:260px">
+      <div style="font-size:0.78rem;font-weight:700;text-transform:uppercase;
+                  letter-spacing:0.06em;color:var(--accent);margin-bottom:10px">
+        Disc Context — for Claude identification
+      </div>
+
+      <!-- Type -->
+      <div style="display:flex;gap:16px;margin-bottom:12px">
+        <label style="display:flex;align-items:center;gap:5px;cursor:pointer;font-size:0.88rem">
+          <input type="radio" name="ctx-type" value="tv" id="ctx-type-tv"
+                 onchange="onCtxType()" {% if not job.disc_context or job.disc_context.type == 'tv' %}checked{% endif %}>
+          TV Show
+        </label>
+        <label style="display:flex;align-items:center;gap:5px;cursor:pointer;font-size:0.88rem">
+          <input type="radio" name="ctx-type" value="movie" id="ctx-type-movie"
+                 onchange="onCtxType()" {% if job.disc_context and job.disc_context.type == 'movie' %}checked{% endif %}>
+          Movie
+        </label>
+      </div>
+
+      <!-- TV fields -->
+      <div id="ctx-tv" style="display:{% if job.disc_context and job.disc_context.type == 'movie' %}none{% else %}flex{% endif %};
+                               gap:10px;flex-wrap:wrap">
+        <div style="flex:3;min-width:150px">
+          <label style="display:block;font-size:0.75rem;font-weight:600;color:var(--muted);
+                        text-transform:uppercase;letter-spacing:0.04em;margin-bottom:3px">Show</label>
+          <input id="ctx-show" type="text" placeholder="The Sopranos"
+                 value="{{ job.disc_context.show if job.disc_context and job.disc_context.show else '' }}"
+                 style="background:var(--surface);border:1px solid var(--border);border-radius:5px;
+                        padding:6px 9px;color:var(--text);font-size:0.88rem;outline:none;width:100%"
+                 onfocus="this.style.borderColor='var(--accent)'"
+                 onblur="this.style.borderColor='var(--border)'">
+        </div>
+        <div style="flex:0 0 70px">
+          <label style="display:block;font-size:0.75rem;font-weight:600;color:var(--muted);
+                        text-transform:uppercase;letter-spacing:0.04em;margin-bottom:3px">Season</label>
+          <input id="ctx-season" type="number" min="1" max="99" placeholder="1"
+                 value="{{ job.disc_context.season if job.disc_context and job.disc_context.season else '' }}"
+                 style="background:var(--surface);border:1px solid var(--border);border-radius:5px;
+                        padding:6px 9px;color:var(--text);font-size:0.88rem;outline:none;width:100%"
+                 onfocus="this.style.borderColor='var(--accent)'"
+                 onblur="this.style.borderColor='var(--border)'">
+        </div>
+        <div style="flex:2;min-width:120px">
+          <label style="display:block;font-size:0.75rem;font-weight:600;color:var(--muted);
+                        text-transform:uppercase;letter-spacing:0.04em;margin-bottom:3px">
+            Episodes on disc</label>
+          <input id="ctx-episodes" type="text" placeholder="1-4 or 1,2,3,4"
+                 value="{{ job.disc_context.episodes | join(', ') if job.disc_context and job.disc_context.episodes else '' }}"
+                 style="background:var(--surface);border:1px solid var(--border);border-radius:5px;
+                        padding:6px 9px;color:var(--text);font-size:0.88rem;outline:none;width:100%"
+                 onfocus="this.style.borderColor='var(--accent)'"
+                 onblur="this.style.borderColor='var(--border)'">
+        </div>
+      </div>
+
+      <!-- Movie fields -->
+      <div id="ctx-movie" style="display:{% if job.disc_context and job.disc_context.type == 'movie' %}flex{% else %}none{% endif %};
+                                  gap:10px;flex-wrap:wrap">
+        <div style="flex:3;min-width:200px">
+          <label style="display:block;font-size:0.75rem;font-weight:600;color:var(--muted);
+                        text-transform:uppercase;letter-spacing:0.04em;margin-bottom:3px">Movie Title</label>
+          <input id="ctx-movie-title" type="text" placeholder="The Godfather"
+                 value="{{ job.disc_context.title if job.disc_context and job.disc_context.title else '' }}"
+                 style="background:var(--surface);border:1px solid var(--border);border-radius:5px;
+                        padding:6px 9px;color:var(--text);font-size:0.88rem;outline:none;width:100%"
+                 onfocus="this.style.borderColor='var(--accent)'"
+                 onblur="this.style.borderColor='var(--border)'">
+        </div>
+        <div style="flex:0 0 80px">
+          <label style="display:block;font-size:0.75rem;font-weight:600;color:var(--muted);
+                        text-transform:uppercase;letter-spacing:0.04em;margin-bottom:3px">Year</label>
+          <input id="ctx-year" type="number" placeholder="1972"
+                 value="{{ job.disc_context.year if job.disc_context and job.disc_context.year else '' }}"
+                 style="background:var(--surface);border:1px solid var(--border);border-radius:5px;
+                        padding:6px 9px;color:var(--text);font-size:0.88rem;outline:none;width:100%"
+                 onfocus="this.style.borderColor='var(--accent)'"
+                 onblur="this.style.borderColor='var(--border)'">
+        </div>
+      </div>
+    </div>
+
+    <!-- Action buttons -->
+    <div style="display:flex;flex-direction:column;gap:8px;padding-top:22px">
+      <button class="btn btn-primary" onclick="saveContext()" style="white-space:nowrap">
+        Save Context
+      </button>
+      <button class="btn btn-encode" id="classify-all-btn" onclick="classifyAll()"
+              style="white-space:nowrap">
+        Classify All with Claude
+      </button>
+    </div>
+  </div>
+  <div id="ctx-status" style="margin-top:8px;font-size:0.82rem;color:var(--muted)"></div>
+</div>
 {% endif %}
 
 {% if titles %}
@@ -73,7 +183,7 @@
 
     <!-- Screenshots -->
     {% if t.screenshots %}
-    <div class="screenshot-strip">
+    <div class="screenshot-strip" id="ss-strip-{{ t.title_num }}">
       {% for ss in t.screenshots %}
       <img class="screenshot-thumb" src="/media/screenshots/{{ ss }}"
            alt="screenshot" loading="lazy"
@@ -81,7 +191,27 @@
       {% endfor %}
     </div>
     {% else %}
-    <div class="no-screenshots">No screenshots available</div>
+    <div class="no-screenshots" id="no-ss-{{ t.title_num }}">No screenshots available</div>
+    {% endif %}
+    {% if job.status not in ('encoding', 'complete') %}
+    <div style="margin-bottom:4px">
+      <button class="cls-btn" style="font-size:0.78rem;padding:3px 10px"
+              id="ss-btn-{{ t.title_num }}"
+              onclick="takeScreenshots({{ t.title_num }})">
+        ↺ Retake Screenshots
+      </button>
+    </div>
+    {% endif %}
+
+    <!-- Staged file info + commit button -->
+    {% if t.staged_path %}
+    <div class="staged-path" id="staged-row-{{ t.title_num }}">
+      <strong>Staged:</strong> {{ t.staged_path | replace('/srv/media/staging/', '') }}
+      &nbsp;
+      <button class="btn-commit" onclick="commitTitle({{ t.title_num }})">
+        Move to Library
+      </button>
+    </div>
     {% endif %}
 
     <!-- Current classification display -->
@@ -126,7 +256,8 @@
     </div>
 
     <!-- Inline classification form (hidden by default) -->
-    <div class="cls-form-wrap hidden" id="cls-form-{{ t.title_num }}">
+    <div class="cls-form-wrap hidden" id="cls-form-{{ t.title_num }}"
+      {%- if t.classification %} data-cls="{{ t.classification | json_attr }}"{% endif %}>
       <form class="cls-form" onsubmit="submitClassification(event, {{ t.title_num }})">
         <input type="hidden" name="type" id="cls-type-{{ t.title_num }}">
 
@@ -212,5 +343,150 @@
 
 <script>
   const JOB_ID = '{{ job.id }}';
+
+  // ── Disc context panel ─────────────────────────────────────────────────────
+
+  function onCtxType() {
+    const type = document.querySelector('input[name="ctx-type"]:checked')?.value;
+    const tv    = document.getElementById('ctx-tv');
+    const movie = document.getElementById('ctx-movie');
+    if (tv)    tv.style.display    = type === 'tv'    ? 'flex' : 'none';
+    if (movie) movie.style.display = type === 'movie' ? 'flex' : 'none';
+  }
+
+  function _parseEpisodes(str) {
+    if (!str) return [];
+    str = str.trim();
+    const rangeM = str.match(/^(\d+)\s*[-–]\s*(\d+)$/);
+    if (rangeM) {
+      const s = parseInt(rangeM[1]), e = parseInt(rangeM[2]);
+      return Array.from({length: Math.max(0, e - s + 1)}, (_, i) => s + i);
+    }
+    return str.split(/[\s,]+/).map(Number).filter(n => n > 0);
+  }
+
+  function _buildCtx() {
+    const type = document.querySelector('input[name="ctx-type"]:checked')?.value;
+    if (!type) return null;
+    if (type === 'tv') {
+      const show = (document.getElementById('ctx-show')?.value || '').trim();
+      if (!show) return null;
+      return {
+        type: 'tv',
+        show,
+        season:   parseInt(document.getElementById('ctx-season')?.value) || null,
+        episodes: _parseEpisodes(document.getElementById('ctx-episodes')?.value || ''),
+      };
+    } else {
+      const title = (document.getElementById('ctx-movie-title')?.value || '').trim();
+      if (!title) return null;
+      return {
+        type: 'movie',
+        title,
+        year: parseInt(document.getElementById('ctx-year')?.value) || null,
+      };
+    }
+  }
+
+  function saveContext() {
+    const ctx = _buildCtx();
+    const status = document.getElementById('ctx-status');
+    if (!ctx) { if (status) status.textContent = 'Enter a show name or movie title first.'; return; }
+    apiPost(`/media/job/${JOB_ID}/context`, { disc_context: ctx })
+      .then(r => {
+        if (status) status.textContent = r.ok ? 'Saved.' : ('Error: ' + (r.error || 'unknown'));
+      })
+      .catch(() => { if (status) status.textContent = 'Network error.'; });
+  }
+
+  function classifyAll() {
+    const ctx    = _buildCtx();
+    const status = document.getElementById('ctx-status');
+    const btn    = document.getElementById('classify-all-btn');
+    if (!ctx) { if (status) status.textContent = 'Save disc context first.'; return; }
+    if (btn) { btn.disabled = true; btn.textContent = 'Running…'; }
+    if (status) status.textContent = 'Saving context and queuing Claude classification…';
+
+    apiPost(`/media/job/${JOB_ID}/context`, { disc_context: ctx })
+      .then(() => apiPost(`/media/job/${JOB_ID}/classify-all`, {}))
+      .then(r => {
+        if (r.ok) {
+          if (status) status.textContent = `Classifying ${r.queued} title(s) in background — refresh in a moment.`;
+          setTimeout(() => location.reload(), 8000);
+        } else {
+          if (btn) { btn.disabled = false; btn.textContent = 'Classify All with Claude'; }
+          if (status) status.textContent = 'Error: ' + (r.error || 'unknown');
+        }
+      })
+      .catch(() => {
+        if (btn) { btn.disabled = false; btn.textContent = 'Classify All with Claude'; }
+        if (status) status.textContent = 'Network error.';
+      });
+  }
+
+  function commitTitle(n) {
+    fetch(`/media/job/${JOB_ID}/title/${n}/commit`, { method: 'POST' })
+      .then(r => r.json())
+      .then(d => {
+        if (d.ok) {
+          const row = document.getElementById('staged-row-' + n);
+          if (row) row.remove();
+          alert('Moved to: ' + d.dest.replace('/srv/media/', ''));
+        } else {
+          alert('Error: ' + (d.error || 'unknown'));
+        }
+      })
+      .catch(e => alert('Network error: ' + e));
+  }
+
+  function commitAll(jobId) {
+    if (!confirm('Move all staged files to the Jellyfin library?')) return;
+    fetch(`/media/job/${jobId}/commit-all`, { method: 'POST' })
+      .then(r => r.json())
+      .then(d => {
+        if (d.ok) {
+          const msg = `Committed ${d.committed} file(s).` + (d.errors.length ? '\nErrors:\n' + d.errors.join('\n') : '');
+          alert(msg);
+          location.reload();
+        } else {
+          alert('Error: ' + (d.error || 'unknown'));
+        }
+      })
+      .catch(e => alert('Network error: ' + e));
+  }
+
+  function takeScreenshots(n) {
+    const btn = document.getElementById('ss-btn-' + n);
+    if (btn) { btn.disabled = true; btn.textContent = 'Working…'; }
+
+    fetch(`/media/job/${JOB_ID}/title/${n}/screenshots`, { method: 'POST' })
+      .then(r => r.json())
+      .then(data => {
+        if (btn) { btn.disabled = false; btn.textContent = '↺ Retake Screenshots'; }
+        if (!data.ok) { alert('Failed: ' + (data.error || 'unknown error')); return; }
+
+        const strip = document.createElement('div');
+        strip.className = 'screenshot-strip';
+        strip.id = 'ss-strip-' + n;
+        data.urls.forEach(url => {
+          const img = document.createElement('img');
+          img.className = 'screenshot-thumb';
+          img.src = url;
+          img.alt = 'screenshot';
+          img.loading = 'lazy';
+          img.onclick = () => openLightbox(url);
+          strip.appendChild(img);
+        });
+
+        // Replace existing strip or no-screenshots placeholder
+        const existing = document.getElementById('ss-strip-' + n)
+                      || document.getElementById('no-ss-' + n);
+        if (existing) existing.replaceWith(strip);
+      })
+      .catch(e => {
+        if (btn) { btn.disabled = false; btn.textContent = '↺ Retake Screenshots'; }
+        alert('Network error: ' + e);
+      });
+  }
 </script>
 {% endblock %}

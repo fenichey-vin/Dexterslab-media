@@ -10,6 +10,7 @@ TV_DIR       = MEDIA_ROOT / 'tv'
 MOVIES_DIR   = MEDIA_ROOT / 'movies'
 SPECIALS_DIR = MEDIA_ROOT / 'specials'
 QUEUE_DIR    = MEDIA_ROOT / 'queue'
+STAGING_DIR  = MEDIA_ROOT / 'staging'
 
 DB_PATH = BASE_DIR / 'mediaintel.db'
 PORT    = 8088

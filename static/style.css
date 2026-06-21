@@ -14,6 +14,7 @@
   --c-review:    #4a9eff;
   --c-approved:  #22c55e;
   --c-encoding:  #a855f7;
+  --c-staged:    #f97316;
   --c-complete:  #22c55e;
   --c-error:     #ef4444;
 
@@ -165,6 +166,7 @@ code {
 .badge.review     { background: rgba(74,158,255,.15); color: var(--c-review); }
 .badge.approved   { background: rgba(34,197,94,.15);  color: var(--c-approved); }
 .badge.encoding   { background: rgba(168,85,247,.15); color: var(--c-encoding); }
+.badge.staged     { background: rgba(249,115,22,.15); color: var(--c-staged); }
 .badge.complete   { background: rgba(34,197,94,.15);  color: var(--c-complete); }
 .badge.error      { background: rgba(239,68,68,.15);  color: var(--c-error); }
 
@@ -178,6 +180,7 @@ code {
 .status-dot.review    { background: var(--c-review); animation: pulse 2s infinite; }
 .status-dot.approved  { background: var(--c-approved); }
 .status-dot.encoding  { background: var(--c-encoding); animation: pulse 1.5s infinite; }
+.status-dot.staged    { background: var(--c-staged); }
 .status-dot.complete  { background: var(--c-complete); }
 
 @keyframes pulse {
@@ -233,6 +236,7 @@ code {
 .job-card.complete  { border-left: 3px solid var(--c-complete); }
 .job-card.approved  { border-left: 3px solid var(--c-approved); }
 .job-card.encoding  { border-left: 3px solid var(--c-encoding); }
+.job-card.staged    { border-left: 3px solid var(--c-staged); }
 .job-card.error     { border-left: 3px solid var(--c-error); }
 
 .job-card-with-action {
@@ -291,6 +295,32 @@ code {
   border: 1px solid rgba(168,85,247,.25);
   color: var(--c-encoding);
 }
+.notice.staged {
+  background: rgba(249,115,22,.1);
+  border: 1px solid rgba(249,115,22,.25);
+  color: var(--c-staged);
+}
+
+.staged-path {
+  padding: 6px 16px 10px;
+  font-size: 0.78rem;
+  color: var(--muted);
+  font-family: 'Courier New', monospace;
+}
+.staged-path strong { color: var(--c-staged); font-style: normal; }
+
+.btn-commit {
+  background: var(--c-staged);
+  color: #000;
+  font-weight: 600;
+  padding: 6px 14px;
+  border-radius: 6px;
+  border: none;
+  cursor: pointer;
+  font-size: 0.82rem;
+  white-space: nowrap;
+}
+.btn-commit:hover { opacity: 0.88; }
 
 /* ─── Title cards ────────────────────────────────────────────────────────────── */
 .title-list { display: flex; flex-direction: column; gap: 20px; }
@@ -584,6 +614,28 @@ code {
   border-radius: 8px;
   box-shadow: 0 0 60px rgba(0,0,0,.8);
 }
+
+/* ─── Rip progress bar ────────────────────────────────────────────────────────── */
+.rip-progress-wrap { margin: 4px 0 8px; }
+.rip-track {
+  height: 6px;
+  background: var(--border);
+  border-radius: 3px;
+  overflow: hidden;
+  margin-bottom: 4px;
+}
+.rip-fill {
+  height: 100%;
+  background: var(--c-ingesting);
+  border-radius: 3px;
+  transition: width 0.4s ease;
+}
+.rip-meta { display: flex; gap: 8px; align-items: baseline; }
+.rip-pct  { font-size: 0.78rem; font-weight: 600; color: var(--c-ingesting); }
+.rip-op   { font-size: 0.75rem; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.rip-stale .rip-fill { background: var(--c-error); }
+.rip-stale .rip-pct  { color: var(--c-error); }
+.rip-stale .rip-op   { color: var(--c-error); }
 
 /* ─── Responsive ──────────────────────────────────────────────────────────────── */
 @media (max-width: 640px) {

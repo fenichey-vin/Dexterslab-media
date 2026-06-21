@@ -14,16 +14,18 @@ PRAGMA foreign_keys = ON;
 PRAGMA journal_mode = WAL;
 
 CREATE TABLE IF NOT EXISTS jobs (
-    id          TEXT PRIMARY KEY,
-    name        TEXT NOT NULL,
-    status      TEXT NOT NULL DEFAULT 'ingesting',
-    disc_label  TEXT,
-    drive       TEXT,
-    review_path TEXT NOT NULL,
-    title_count INTEGER NOT NULL DEFAULT 0,
-    created_at  TEXT NOT NULL,
-    updated_at  TEXT NOT NULL,
-    notes       TEXT
+    id           TEXT PRIMARY KEY,
+    name         TEXT NOT NULL,
+    status       TEXT NOT NULL DEFAULT 'ingesting',
+    disc_label   TEXT,
+    drive        TEXT,
+    review_path  TEXT NOT NULL,
+    title_count  INTEGER NOT NULL DEFAULT 0,
+    created_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL,
+    notes        TEXT,
+    disc_context TEXT,
+    rip_progress TEXT
 );
 
 CREATE TABLE IF NOT EXISTS titles (
@@ -37,6 +39,7 @@ CREATE TABLE IF NOT EXISTS titles (
     flags           TEXT NOT NULL DEFAULT '[]',
     classification  TEXT,
     classified_at   TEXT,
+    staged_path     TEXT,
     UNIQUE(job_id, title_num)
 );
 
@@ -68,6 +71,22 @@ def _db():
 def init_db():
     with _db() as conn:
         conn.executescript(SCHEMA)
+        for col, definition in [
+            ('disc_context', 'TEXT'),
+            ('staged_path',  'TEXT'),
+        ]:
+            try:
+                conn.execute(f'ALTER TABLE titles ADD COLUMN {col} {definition}')
+            except Exception:
+                pass
+        try:
+            conn.execute('ALTER TABLE jobs ADD COLUMN disc_context TEXT')
+        except Exception:
+            pass
+        try:
+            conn.execute('ALTER TABLE jobs ADD COLUMN rip_progress TEXT')
+        except Exception:
+            pass
 
 
 def _now():
@@ -76,14 +95,16 @@ def _now():
 
 # ── Jobs ────────────────────────────────────────────────────────────────────
 
-def create_job(job_id, name, review_path, drive='', disc_label=''):
+def create_job(job_id, name, review_path, drive='', disc_label='', disc_context=None):
     now = _now()
     with _db() as conn:
         conn.execute(
             '''INSERT OR IGNORE INTO jobs
-               (id, name, status, disc_label, drive, review_path, title_count, created_at, updated_at)
-               VALUES (?,?,?,?,?,?,0,?,?)''',
-            (job_id, name, 'ingesting', disc_label, drive, str(review_path), now, now)
+               (id, name, status, disc_label, drive, review_path, title_count,
+                created_at, updated_at, disc_context)
+               VALUES (?,?,?,?,?,?,0,?,?,?)''',
+            (job_id, name, 'ingesting', disc_label, drive, str(review_path), now, now,
+             json.dumps(disc_context) if disc_context else None)
         )
 
 
@@ -110,16 +131,48 @@ def increment_title_count(job_id):
         )
 
 
+def _parse_job(row):
+    j = dict(row)
+    if j.get('disc_context'):
+        try:
+            j['disc_context'] = json.loads(j['disc_context'])
+        except Exception:
+            j['disc_context'] = None
+    if j.get('rip_progress'):
+        try:
+            j['rip_progress'] = json.loads(j['rip_progress'])
+        except Exception:
+            j['rip_progress'] = None
+    return j
+
+
 def get_job(job_id):
     with _db() as conn:
         row = conn.execute('SELECT * FROM jobs WHERE id=?', (job_id,)).fetchone()
-        return dict(row) if row else None
+        return _parse_job(row) if row else None
 
 
 def get_all_jobs():
     with _db() as conn:
         rows = conn.execute('SELECT * FROM jobs ORDER BY created_at DESC').fetchall()
-        return [dict(r) for r in rows]
+        return [_parse_job(r) for r in rows]
+
+
+def set_rip_progress(job_id, progress):
+    """Write or clear rip progress. progress=dict or None to clear."""
+    with _db() as conn:
+        conn.execute(
+            'UPDATE jobs SET rip_progress=? WHERE id=?',
+            (json.dumps(progress) if progress else None, job_id)
+        )
+
+
+def set_disc_context(job_id, disc_context):
+    with _db() as conn:
+        conn.execute(
+            'UPDATE jobs SET disc_context=?, updated_at=? WHERE id=?',
+            (json.dumps(disc_context) if disc_context else None, _now(), job_id)
+        )
 
 
 def delete_job(job_id):
@@ -147,7 +200,7 @@ def add_title(job_id, title_num, filepath, duration_secs=None,
 
 def update_title(job_id, title_num, **kwargs):
     """Update specific fields on a title."""
-    allowed = {'duration_secs', 'filesize_bytes', 'screenshots', 'flags', 'filepath'}
+    allowed = {'duration_secs', 'filesize_bytes', 'screenshots', 'flags', 'filepath', 'staged_path'}
     fields = {k: v for k, v in kwargs.items() if k in allowed}
     if not fields:
         return

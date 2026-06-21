@@ -5,17 +5,21 @@
 <meta http-equiv="refresh" content="5">
 {% endif %}
 
+
 {% block content %}
 <div class="page-header">
   <div>
     <h1>Ingestion Dashboard</h1>
     <div class="header-meta">
-      {{ (active|length) + (review|length) + (approved|length) + (encoding|length) + (completed|length) }} disc{{ 's' if (active|length + review|length + approved|length + encoding|length + completed|length) != 1 else '' }}
+      {{ (active|length) + (review|length) + (approved|length) + (encoding|length) + (staged|length) + (completed|length) }} disc{{ 's' if (active|length + review|length + approved|length + encoding|length + staged|length + completed|length) != 1 else '' }}
       &nbsp;·&nbsp;
       {{ total_titles }} title{{ 's' if total_titles != 1 else '' }}
     </div>
   </div>
-  <a href="/media/rip" class="btn btn-primary">+ New Rip</a>
+  <div style="display:flex;gap:10px">
+    <a href="/media/upload" class="btn btn-primary" style="background:var(--surface2);border:1px solid var(--border);color:var(--text)">⬆ Upload MKVs</a>
+    <a href="/media/rip" class="btn btn-primary">+ New Rip</a>
+  </div>
 </div>
 
 {% if active %}
@@ -26,11 +30,28 @@
   </h2>
   <div class="job-grid">
     {% for job in active %}
+    {% set p = job.rip_progress %}
+    {% set stale = p and (now - p.ts) > 90 %}
     <a href="/media/job/{{ job.id }}" class="job-card ingesting">
       <div class="job-card-name">{{ job.name }}</div>
+      {% if p %}
+      <div class="rip-progress-wrap {{ 'rip-stale' if stale else '' }}">
+        <div class="rip-track">
+          <div class="rip-fill" style="width:{{ p.pct }}%"></div>
+        </div>
+        <div class="rip-meta">
+          <span class="rip-pct">{{ p.pct }}%</span>
+          {% if stale %}
+          <span class="rip-op">⚠ stalled — no update for {{ ((now - p.ts) / 60) | int }}m</span>
+          {% elif p.op %}
+          <span class="rip-op">{{ p.op }}</span>
+          {% endif %}
+        </div>
+      </div>
+      {% endif %}
       <div class="job-card-meta">
         <span class="badge ingesting">Ripping…</span>
-        <span>{{ job.title_count }} title{{ 's' if job.title_count != 1 else '' }}</span>
+        <span>{{ job.title_count }} title{{ 's' if job.title_count != 1 else '' }} done</span>
       </div>
       <div class="job-card-time">{{ job.created_at | reltime }}</div>
     </a>
@@ -110,6 +131,32 @@
 </section>
 {% endif %}
 
+{% if staged %}
+<section class="job-section">
+  <h2 class="section-title">
+    <span class="status-dot staged"></span>
+    Staged — Watch &amp; Commit ({{ staged|length }})
+  </h2>
+  <div class="job-grid">
+    {% for job in staged %}
+    <div class="job-card staged job-card-with-action">
+      <a href="/media/job/{{ job.id }}" class="job-card-inner">
+        <div class="job-card-name">{{ job.name }}</div>
+        <div class="job-card-meta">
+          <span class="badge staged">Staged</span>
+          <span>{{ job.title_count }} title{{ 's' if job.title_count != 1 else '' }}</span>
+        </div>
+        <div class="job-card-time">{{ job.created_at | reltime }}</div>
+      </a>
+      <button class="btn btn-commit" onclick="commitAll('{{ job.id }}', event)">
+        ✓ Commit All
+      </button>
+    </div>
+    {% endfor %}
+  </div>
+</section>
+{% endif %}
+
 {% if completed %}
 <section class="job-section">
   <h2 class="section-title">
@@ -131,11 +178,32 @@
 </section>
 {% endif %}
 
-{% if not active and not review and not approved and not encoding and not completed %}
+{% if not active and not review and not approved and not encoding and not staged and not completed %}
 <div class="empty-state">
   <div class="empty-icon">◈</div>
   <h2>No ingestion jobs yet</h2>
   <p>Run <code>riptv</code> in a terminal to start ripping a disc. Jobs appear here automatically.</p>
 </div>
 {% endif %}
+{% endblock %}
+
+{% block extra_js %}
+<script>
+function commitAll(jobId, event) {
+  if (event) { event.preventDefault(); event.stopPropagation(); }
+  if (!confirm('Move all staged files to the Jellyfin library?')) return;
+  fetch(`/media/job/${jobId}/commit-all`, { method: 'POST' })
+    .then(r => r.json())
+    .then(d => {
+      if (d.ok) {
+        const msg = `Committed ${d.committed} file(s).` + (d.errors.length ? '\nErrors:\n' + d.errors.join('\n') : '');
+        alert(msg);
+        location.reload();
+      } else {
+        alert('Error: ' + (d.error || 'unknown'));
+      }
+    })
+    .catch(e => alert('Network error: ' + e));
+}
+</script>
 {% endblock %}

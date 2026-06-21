@@ -1,0 +1,240 @@
+{% extends "base.html" %}
+{% block title %}Upload MKVs — Media Intel{% endblock %}
+
+{% block content %}
+<div class="page-header">
+  <div>
+    <a href="/media/" class="back-link">← Dashboard</a>
+    <h1>Upload MKVs</h1>
+  </div>
+</div>
+
+<div style="max-width:760px">
+
+  <!-- Job name -->
+  <div style="margin-bottom:24px">
+    <label style="display:block;font-size:0.8rem;font-weight:600;color:var(--muted);
+                  text-transform:uppercase;letter-spacing:0.04em;margin-bottom:6px">
+      Job Name
+    </label>
+    <input id="job-name" type="text" placeholder="e.g. Seinfeld S03 Disc1"
+           style="background:var(--surface2);border:1px solid var(--border);
+                  border-radius:6px;padding:8px 12px;color:var(--text);
+                  font-size:0.95rem;outline:none;width:100%;max-width:420px;
+                  transition:border-color 0.15s"
+           onfocus="this.style.borderColor='var(--accent)'"
+           onblur="this.style.borderColor='var(--border)'"
+           oninput="updateUploadBtn()">
+  </div>
+
+  <!-- Drop zone -->
+  <div id="drop-zone"
+       style="border:2px dashed var(--border);border-radius:10px;
+              padding:48px 24px;text-align:center;cursor:pointer;
+              transition:border-color 0.15s,background 0.15s;margin-bottom:20px"
+       onclick="document.getElementById('file-input').click()"
+       ondragover="handleDragOver(event)"
+       ondragleave="handleDragLeave(event)"
+       ondrop="handleDrop(event)">
+    <div style="font-size:2rem;margin-bottom:12px;color:var(--muted)">⬆</div>
+    <div style="font-size:1rem;font-weight:600;margin-bottom:6px">
+      Drop MKV files here
+    </div>
+    <div style="font-size:0.85rem;color:var(--muted)">
+      or click to browse — multiple files OK
+    </div>
+    <input id="file-input" type="file" accept=".mkv" multiple
+           style="display:none" onchange="handleFileSelect(this.files)">
+  </div>
+
+  <!-- File list -->
+  <div id="file-list" class="hidden"
+       style="background:var(--surface2);border:1px solid var(--border);
+              border-radius:8px;margin-bottom:20px;overflow:hidden">
+    <div style="padding:10px 16px;border-bottom:1px solid var(--border);
+                font-size:0.78rem;font-weight:700;text-transform:uppercase;
+                letter-spacing:0.06em;color:var(--muted);display:flex;
+                justify-content:space-between;align-items:center">
+      <span id="file-count-label">Files</span>
+      <button onclick="clearFiles()"
+              style="background:none;border:none;color:var(--muted);
+                     cursor:pointer;font-size:0.8rem;padding:0">
+        Clear
+      </button>
+    </div>
+    <div id="file-items"></div>
+  </div>
+
+  <!-- Progress bar -->
+  <div id="progress-wrap" class="hidden" style="margin-bottom:20px">
+    <div style="background:var(--surface2);border:1px solid var(--border);
+                border-radius:6px;overflow:hidden;height:8px;margin-bottom:8px">
+      <div id="progress-bar"
+           style="height:100%;width:0%;background:var(--accent);
+                  transition:width 0.2s ease"></div>
+    </div>
+    <div id="progress-text"
+         style="font-size:0.85rem;color:var(--muted);text-align:center"></div>
+  </div>
+
+  <button id="upload-btn" class="btn btn-primary" onclick="startUpload()" disabled>
+    Upload &amp; Process
+  </button>
+
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+'use strict';
+
+let _files = [];
+
+/* ── Drag-and-drop ─────────────────────────────────────── */
+
+function handleDragOver(e) {
+  e.preventDefault();
+  const zone = document.getElementById('drop-zone');
+  zone.style.borderColor = 'var(--accent)';
+  zone.style.background  = 'rgba(74,158,255,0.05)';
+}
+
+function handleDragLeave(e) {
+  const zone = document.getElementById('drop-zone');
+  zone.style.borderColor = 'var(--border)';
+  zone.style.background  = '';
+}
+
+function handleDrop(e) {
+  e.preventDefault();
+  handleDragLeave(e);
+  const dropped = [...e.dataTransfer.files].filter(f => f.name.toLowerCase().endsWith('.mkv'));
+  if (!dropped.length) { alert('Please drop MKV files only.'); return; }
+  addFiles(dropped);
+}
+
+function handleFileSelect(fileList) {
+  addFiles([...fileList]);
+}
+
+function addFiles(newFiles) {
+  // Merge, deduplicate by name
+  const existing = new Set(_files.map(f => f.name));
+  newFiles.forEach(f => { if (!existing.has(f.name)) _files.push(f); });
+  renderFileList();
+  updateUploadBtn();
+}
+
+function clearFiles() {
+  _files = [];
+  document.getElementById('file-input').value = '';
+  renderFileList();
+  updateUploadBtn();
+}
+
+function removeFile(idx) {
+  _files.splice(idx, 1);
+  renderFileList();
+  updateUploadBtn();
+}
+
+function renderFileList() {
+  const wrap  = document.getElementById('file-list');
+  const items = document.getElementById('file-items');
+  const label = document.getElementById('file-count-label');
+
+  if (!_files.length) { wrap.classList.add('hidden'); return; }
+  wrap.classList.remove('hidden');
+
+  const total = _files.reduce((s, f) => s + f.size, 0);
+  label.textContent = `${_files.length} file${_files.length !== 1 ? 's' : ''} — ${_fmtSize(total)}`;
+
+  items.innerHTML = '';
+  _files.forEach((f, i) => {
+    const row = document.createElement('div');
+    row.style.cssText = 'display:flex;align-items:center;padding:8px 16px;' +
+      (i < _files.length - 1 ? 'border-bottom:1px solid var(--border);' : '');
+    row.innerHTML =
+      `<span style="flex:1;font-size:0.9rem;overflow:hidden;text-overflow:ellipsis;
+                    white-space:nowrap">${f.name}</span>
+       <span style="color:var(--muted);font-size:0.8rem;margin-left:12px;flex-shrink:0">
+         ${_fmtSize(f.size)}</span>
+       <button onclick="removeFile(${i})"
+               style="background:none;border:none;color:var(--muted);cursor:pointer;
+                      margin-left:12px;font-size:0.9rem;flex-shrink:0;padding:0">✕</button>`;
+    items.appendChild(row);
+  });
+}
+
+function _fmtSize(b) {
+  if (b < 1024) return b + ' B';
+  if (b < 1024 * 1024) return (b / 1024).toFixed(1) + ' KB';
+  if (b < 1024 ** 3)   return (b / 1024 ** 2).toFixed(1) + ' MB';
+  return (b / 1024 ** 3).toFixed(2) + ' GB';
+}
+
+/* ── Upload ────────────────────────────────────────────── */
+
+function updateUploadBtn() {
+  const jobName = (document.getElementById('job-name').value || '').trim();
+  document.getElementById('upload-btn').disabled = !jobName || _files.length === 0;
+}
+
+function startUpload() {
+  const jobName = (document.getElementById('job-name').value || '').trim();
+  if (!jobName) { alert('Please enter a job name.'); return; }
+  if (!_files.length) { alert('No files selected.'); return; }
+
+  const fd = new FormData();
+  fd.append('job_name', jobName);
+  _files.forEach(f => fd.append('files', f));
+
+  // Lock UI
+  document.getElementById('upload-btn').disabled = true;
+  document.getElementById('drop-zone').style.pointerEvents = 'none';
+  document.getElementById('drop-zone').style.opacity = '0.5';
+
+  const wrap = document.getElementById('progress-wrap');
+  const bar  = document.getElementById('progress-bar');
+  const txt  = document.getElementById('progress-text');
+  wrap.classList.remove('hidden');
+  txt.textContent = 'Uploading…';
+
+  const xhr = new XMLHttpRequest();
+
+  xhr.upload.onprogress = e => {
+    if (!e.lengthComputable) return;
+    const pct = Math.round(e.loaded / e.total * 100);
+    bar.style.width  = pct + '%';
+    txt.textContent  = `Uploading… ${pct}%  (${_fmtSize(e.loaded)} / ${_fmtSize(e.total)})`;
+  };
+
+  xhr.onload = () => {
+    let data;
+    try { data = JSON.parse(xhr.responseText); } catch(e) { data = {}; }
+    if (xhr.status === 200 && data.ok) {
+      bar.style.width  = '100%';
+      txt.textContent  = 'Upload complete — processing in background…';
+      setTimeout(() => { window.location.href = '/media/'; }, 800);
+    } else {
+      txt.textContent = 'Upload failed: ' + (data.error || xhr.statusText);
+      txt.style.color = 'var(--c-error)';
+      document.getElementById('upload-btn').disabled = false;
+      document.getElementById('drop-zone').style.pointerEvents = '';
+      document.getElementById('drop-zone').style.opacity = '';
+    }
+  };
+
+  xhr.onerror = () => {
+    txt.textContent = 'Network error during upload.';
+    txt.style.color = 'var(--c-error)';
+    document.getElementById('upload-btn').disabled = false;
+    document.getElementById('drop-zone').style.pointerEvents = '';
+    document.getElementById('drop-zone').style.opacity = '';
+  };
+
+  xhr.open('POST', '/media/upload');
+  xhr.send(fd);
+}
+</script>
+{% endblock %}

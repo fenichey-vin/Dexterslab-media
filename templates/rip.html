@@ -19,9 +19,14 @@
     </div>
     {% elif drives|length == 1 %}
     <p style="color:var(--muted);font-size:0.9rem;margin-bottom:12px">
-      Drive: <strong style="color:var(--text)">{{ drives[0] }}</strong>
+      Drive: <strong style="color:var(--text)">{{ drives[0].device }}</strong>
+      {% if drives[0].has_media %}
+        <span style="color:var(--accent);font-size:0.8rem;margin-left:8px">● disc detected</span>
+      {% else %}
+        <span style="color:var(--muted);font-size:0.8rem;margin-left:8px">○ no disc</span>
+      {% endif %}
     </p>
-    <input type="hidden" id="drive-select" value="{{ drives[0] }}">
+    <input type="hidden" id="drive-select" value="{{ drives[0].device }}">
     {% else %}
     <label style="display:block;font-size:0.8rem;font-weight:600;color:var(--muted);
                   text-transform:uppercase;letter-spacing:0.04em;margin-bottom:6px">
@@ -32,7 +37,7 @@
                    border-radius:6px;padding:8px 12px;color:var(--text);
                    font-size:0.9rem;outline:none;width:100%;max-width:320px">
       {% for d in drives %}
-      <option value="{{ d }}">{{ d }}</option>
+      <option value="{{ d.device }}">{{ d.device }}{% if d.has_media %} — disc detected{% else %} — empty{% endif %}</option>
       {% endfor %}
     </select>
     {% endif %}
@@ -63,10 +68,110 @@
       <div id="disc-label-display"
            style="font-size:1.05rem;font-weight:600;margin-bottom:16px"></div>
 
-      <!-- Claude ID card (shown only when disc_id is returned) -->
-      <div id="disc-id-card" class="disc-id-card hidden">
-        <div class="disc-id-label">⚡ Claude Identification</div>
-        <div id="disc-id-text"></div>
+      <!-- Disc context — editable, pre-filled from Claude scan -->
+      <div style="background:var(--surface2);border:1px solid var(--border);border-radius:8px;
+                  padding:16px;margin-bottom:20px">
+        <div style="font-size:0.78rem;font-weight:700;text-transform:uppercase;
+                    letter-spacing:0.06em;color:var(--accent);margin-bottom:12px">
+          Disc Content — Confirm Before Ripping
+        </div>
+        <p style="font-size:0.82rem;color:var(--muted);margin:0 0 12px">
+          Claude uses this to identify each episode. Correct it if the auto-detection is wrong.
+        </p>
+
+        <!-- Type selector -->
+        <div style="display:flex;gap:16px;margin-bottom:14px;align-items:center">
+          <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:0.9rem">
+            <input type="radio" name="ctx-type" value="tv" id="ctx-type-tv" checked
+                   onchange="onCtxTypeChange()"> TV Show
+          </label>
+          <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:0.9rem">
+            <input type="radio" name="ctx-type" value="movie" id="ctx-type-movie"
+                   onchange="onCtxTypeChange()"> Movie
+          </label>
+          <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:0.9rem">
+            <input type="radio" name="ctx-type" value="unknown" id="ctx-type-unknown"
+                   onchange="onCtxTypeChange()"> Unknown
+          </label>
+        </div>
+
+        <!-- TV fields -->
+        <div id="ctx-tv-fields" style="display:flex;gap:12px;flex-wrap:wrap">
+          <div style="flex:3;min-width:160px">
+            <label style="display:block;font-size:0.78rem;font-weight:600;color:var(--muted);
+                          text-transform:uppercase;letter-spacing:0.04em;margin-bottom:4px">
+              Show Name
+            </label>
+            <input id="ctx-show" type="text" placeholder="e.g. The Sopranos"
+                   oninput="_syncJobName()"
+                   style="background:var(--surface);border:1px solid var(--border);
+                          border-radius:6px;padding:7px 10px;color:var(--text);
+                          font-size:0.9rem;outline:none;width:100%;
+                          transition:border-color 0.15s"
+                   onfocus="this.style.borderColor='var(--accent)'"
+                   onblur="this.style.borderColor='var(--border)'">
+          </div>
+          <div style="flex:0 0 80px">
+            <label style="display:block;font-size:0.78rem;font-weight:600;color:var(--muted);
+                          text-transform:uppercase;letter-spacing:0.04em;margin-bottom:4px">
+              Season
+            </label>
+            <input id="ctx-season" type="number" min="1" max="99" placeholder="1"
+                   oninput="_syncJobName()"
+                   style="background:var(--surface);border:1px solid var(--border);
+                          border-radius:6px;padding:7px 10px;color:var(--text);
+                          font-size:0.9rem;outline:none;width:100%;
+                          transition:border-color 0.15s"
+                   onfocus="this.style.borderColor='var(--accent)'"
+                   onblur="this.style.borderColor='var(--border)'">
+          </div>
+          <div style="flex:2;min-width:140px">
+            <label style="display:block;font-size:0.78rem;font-weight:600;color:var(--muted);
+                          text-transform:uppercase;letter-spacing:0.04em;margin-bottom:4px">
+              Episodes on disc
+              <span style="font-weight:400;text-transform:none;letter-spacing:0">(e.g. 1-4 or 1,2,3,4)</span>
+            </label>
+            <input id="ctx-episodes" type="text" placeholder="1-4"
+                   style="background:var(--surface);border:1px solid var(--border);
+                          border-radius:6px;padding:7px 10px;color:var(--text);
+                          font-size:0.9rem;outline:none;width:100%;
+                          transition:border-color 0.15s"
+                   onfocus="this.style.borderColor='var(--accent)'"
+                   onblur="this.style.borderColor='var(--border)'">
+          </div>
+        </div>
+
+        <!-- Movie fields -->
+        <div id="ctx-movie-fields" style="display:none;gap:12px;flex-wrap:wrap">
+          <div style="flex:3;min-width:200px">
+            <label style="display:block;font-size:0.78rem;font-weight:600;color:var(--muted);
+                          text-transform:uppercase;letter-spacing:0.04em;margin-bottom:4px">
+              Movie Title
+            </label>
+            <input id="ctx-movie-title" type="text" placeholder="e.g. The Godfather"
+                   oninput="_syncJobName()"
+                   style="background:var(--surface);border:1px solid var(--border);
+                          border-radius:6px;padding:7px 10px;color:var(--text);
+                          font-size:0.9rem;outline:none;width:100%;
+                          transition:border-color 0.15s"
+                   onfocus="this.style.borderColor='var(--accent)'"
+                   onblur="this.style.borderColor='var(--border)'">
+          </div>
+          <div style="flex:0 0 90px">
+            <label style="display:block;font-size:0.78rem;font-weight:600;color:var(--muted);
+                          text-transform:uppercase;letter-spacing:0.04em;margin-bottom:4px">
+              Year
+            </label>
+            <input id="ctx-year" type="number" min="1888" max="2100" placeholder="1972"
+                   oninput="_syncJobName()"
+                   style="background:var(--surface);border:1px solid var(--border);
+                          border-radius:6px;padding:7px 10px;color:var(--text);
+                          font-size:0.9rem;outline:none;width:100%;
+                          transition:border-color 0.15s"
+                   onfocus="this.style.borderColor='var(--accent)'"
+                   onblur="this.style.borderColor='var(--border)'">
+          </div>
+        </div>
       </div>
 
       <!-- Job name -->
@@ -82,7 +187,7 @@
                       transition:border-color 0.15s"
                onfocus="this.style.borderColor='var(--accent)'"
                onblur="this.style.borderColor='var(--border)'"
-               oninput="updateRipCount()">
+               oninput="_jobNameEdited = true; updateRipCount()">
       </div>
     </section>
 
@@ -122,27 +227,100 @@
 <script>
 'use strict';
 
-// Disc state populated after scan
-let _discTitles  = [];
-let _discId      = null;
-let _scanDone    = false;
-let _scanTimer   = null;
+let _discTitles      = [];
+let _scanTimer       = null;
+let _jobNameEdited   = false;
 
 function _getDrive() {
   const el = document.getElementById('drive-select');
   return el ? el.value : '';
 }
 
+// ── Disc context helpers ─────────────────────────────────────────────────────
+
+function onCtxTypeChange() {
+  const type = document.querySelector('input[name="ctx-type"]:checked')?.value;
+  document.getElementById('ctx-tv-fields').style.display    = type === 'tv'    ? 'flex' : 'none';
+  document.getElementById('ctx-movie-fields').style.display = type === 'movie' ? 'flex' : 'none';
+  _syncJobName();
+}
+
+function _syncJobName() {
+  if (_jobNameEdited) return;
+  const type = document.querySelector('input[name="ctx-type"]:checked')?.value;
+  let name = '';
+  if (type === 'tv') {
+    const show   = (document.getElementById('ctx-show').value || '').trim();
+    const season = (document.getElementById('ctx-season').value || '').trim();
+    if (show) name = show + (season ? ` S${season.padStart(2,'0')}` : '');
+  } else if (type === 'movie') {
+    const title = (document.getElementById('ctx-movie-title').value || '').trim();
+    const year  = (document.getElementById('ctx-year').value || '').trim();
+    if (title) name = title + (year ? ` (${year})` : '');
+  }
+  if (name) document.getElementById('job-name').value = name;
+}
+
+function _parseEpisodes(str) {
+  if (!str) return [];
+  str = str.trim();
+  const rangeM = str.match(/^(\d+)\s*[-–]\s*(\d+)$/);
+  if (rangeM) {
+    const s = parseInt(rangeM[1]), e = parseInt(rangeM[2]);
+    return Array.from({length: Math.max(0, e - s + 1)}, (_, i) => s + i);
+  }
+  return str.split(/[\s,]+/).map(Number).filter(n => n > 0);
+}
+
+function _buildDiscContext() {
+  const type = document.querySelector('input[name="ctx-type"]:checked')?.value;
+  if (!type || type === 'unknown') return null;
+  if (type === 'tv') {
+    const show     = document.getElementById('ctx-show').value.trim();
+    const seasonV  = document.getElementById('ctx-season').value.trim();
+    const epStr    = document.getElementById('ctx-episodes').value.trim();
+    const season   = seasonV ? parseInt(seasonV) : null;
+    const episodes = _parseEpisodes(epStr);
+    if (!show) return null;
+    return { type: 'tv', show, season, episodes };
+  } else {
+    const title = document.getElementById('ctx-movie-title').value.trim();
+    const yearV = document.getElementById('ctx-year').value.trim();
+    const year  = yearV ? parseInt(yearV) : null;
+    if (!title) return null;
+    return { type: 'movie', title, year };
+  }
+}
+
+function _prefillContextFromScan(discId) {
+  if (!discId) return;
+  if (discId.type === 'tv') {
+    document.getElementById('ctx-type-tv').checked = true;
+    onCtxTypeChange();
+    if (discId.show)    document.getElementById('ctx-show').value   = discId.show;
+    if (discId.season)  document.getElementById('ctx-season').value = discId.season;
+    if ((discId.episodes || []).length)
+      document.getElementById('ctx-episodes').value = discId.episodes.join(', ');
+  } else if (discId.type === 'movie') {
+    document.getElementById('ctx-type-movie').checked = true;
+    onCtxTypeChange();
+    if (discId.title) document.getElementById('ctx-movie-title').value = discId.title;
+    if (discId.year)  document.getElementById('ctx-year').value        = discId.year;
+  }
+  _syncJobName();
+}
+
+// ── Scan ─────────────────────────────────────────────────────────────────────
+
 function scanDisc() {
   const drive = _getDrive();
   if (!drive) { alert('No drive available.'); return; }
 
-  _scanDone = false;
+  _jobNameEdited = false;
   document.getElementById('scan-btn').disabled = true;
   document.getElementById('scan-loading').classList.remove('hidden');
   document.getElementById('results-panel').classList.add('hidden');
 
-  // "Still scanning…" hint after 30 s
   _scanTimer = setTimeout(() => {
     const msg = document.getElementById('scan-loading-msg');
     if (msg) msg.textContent = 'Still scanning… MakeMKV can take up to 2 minutes on some discs';
@@ -158,43 +336,16 @@ function scanDisc() {
     clearTimeout(_scanTimer);
     document.getElementById('scan-loading').classList.add('hidden');
     document.getElementById('scan-btn').disabled = false;
-    _scanDone = true;
 
     if (data.error) { alert('Scan error: ' + data.error); return; }
 
     _discTitles = data.titles || [];
-    _discId     = data.disc_id || null;
 
-    // Disc label
     document.getElementById('disc-label-display').textContent = data.disc_label || '';
 
-    // Job name pre-fill (cleaned disc label)
-    const clean = (data.disc_label || '')
-      .replace(/_/g, ' ')
-      .replace(/\s+/g, ' ')
-      .trim();
-    document.getElementById('job-name').value = clean;
+    // Pre-fill context fields from Claude disc ID; user can correct before ripping
+    _prefillContextFromScan(data.disc_id || null);
 
-    // Claude ID card
-    const card = document.getElementById('disc-id-card');
-    const txt  = document.getElementById('disc-id-text');
-    if (_discId) {
-      txt.innerHTML = _formatDiscId(_discId);
-      card.classList.remove('hidden');
-
-      // Pre-fill job name from Claude suggestion when available
-      if (_discId.type === 'tv' && _discId.show) {
-        const season = _discId.season ? ` S${String(_discId.season).padStart(2,'0')}` : '';
-        document.getElementById('job-name').value = _discId.show + season;
-      } else if (_discId.type === 'movie' && _discId.title) {
-        const yr = _discId.year ? ` (${_discId.year})` : '';
-        document.getElementById('job-name').value = _discId.title + yr;
-      }
-    } else {
-      card.classList.add('hidden');
-    }
-
-    // Build titles table
     _buildTitlesTable(_discTitles);
     document.getElementById('results-panel').classList.remove('hidden');
     updateRipCount();
@@ -205,22 +356,6 @@ function scanDisc() {
     document.getElementById('scan-btn').disabled = false;
     alert('Network error during scan: ' + e);
   });
-}
-
-function _formatDiscId(d) {
-  if (!d) return '';
-  if (d.type === 'tv') {
-    const epCount = (d.episodes || []).length;
-    const season  = d.season ? ` · Season ${d.season}` : '';
-    const eps     = epCount ? ` · ${epCount} episode${epCount !== 1 ? 's' : ''} detected` : '';
-    return `<strong>${d.show || '?'}</strong>${season}${eps}`;
-  }
-  if (d.type === 'movie') {
-    const yr  = d.year  ? ` (${d.year})`           : '';
-    const mt  = d.main_title ? ` · Main feature on title ${d.main_title}` : '';
-    return `<strong>${d.title || '?'}</strong>${yr}${mt}`;
-  }
-  return JSON.stringify(d);
 }
 
 function _buildTitlesTable(titles) {
@@ -318,10 +453,10 @@ function startRip() {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      job_name:   jobName,
-      device:     drive,
-      title_nums: titleNums,
-      disc_id:    _discId
+      job_name:     jobName,
+      device:       drive,
+      title_nums:   titleNums,
+      disc_context: _buildDiscContext()
     })
   })
   .then(r => r.json())
