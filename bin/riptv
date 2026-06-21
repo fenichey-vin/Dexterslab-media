@@ -12,6 +12,8 @@ import re
 import json
 import subprocess
 import sqlite3
+import shutil
+import threading
 import time
 from pathlib import Path
 from datetime import datetime, timezone
@@ -259,25 +261,52 @@ def rip_title(device, title_num, output_dir, job_id):
     """Run makemkvcon to rip a single title. Returns path to MKV or None."""
     print(f'  Ripping title {title_num}…')
 
+    cmd = ['makemkvcon', '-r', 'mkv', f'dev:{device}', str(title_num), str(output_dir)]
+    if shutil.which('stdbuf'):
+        cmd = ['stdbuf', '-oL'] + cmd
+
     proc = subprocess.Popen(
-        ['makemkvcon', '-r', 'mkv', f'dev:{device}', str(title_num), str(output_dir)],
+        cmd,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         text=True, bufsize=1
     )
 
-    last_write = 0.0
+    prgv_seen        = [False]
+    stop_event       = threading.Event()
+    start_time       = time.time()
+    last_write       = 0.0
     last_pct_printed = -10
     pct = 0
-    op = ''
+    op  = ''
+
+    def _size_poll():
+        ESTIMATE = 25 * 60
+        while not stop_event.wait(4):
+            if prgv_seen[0]:
+                return
+            try:
+                mkv_files = sorted(output_dir.glob('*.mkv'))
+                if not mkv_files:
+                    continue
+                size_gb = mkv_files[0].stat().st_size / (1024 ** 3)
+                elapsed = time.time() - start_time
+                p       = min(int(elapsed / ESTIMATE * 100), 95)
+                _write_progress(job_id, title_num, p,
+                                f'Ripping… {size_gb:.1f} GB written')
+                print(f'    {p:3d}%  {size_gb:.1f} GB written')
+            except Exception:
+                pass
+
+    threading.Thread(target=_size_poll, daemon=True).start()
 
     for raw in proc.stdout:
         line = raw.rstrip()
 
-        # PRGV:current,total,max — percentage done
         m = re.match(r'^PRGV:(\d+),\d+,(\d+)', line)
         if m:
             cur, mx = int(m.group(1)), int(m.group(2))
             pct = int(cur * 100 / mx) if mx else 0
+            prgv_seen[0] = True
             now = time.time()
             if now - last_write >= 3:
                 _write_progress(job_id, title_num, pct, op)
@@ -287,18 +316,17 @@ def rip_title(device, title_num, output_dir, job_id):
                 last_pct_printed = (pct // 10) * 10
             continue
 
-        # PRGC / PRGT — current operation label
         m = re.match(r'^PRG[CT]:\d+,\d+,"([^"]*)"', line)
         if m:
             op = m.group(1)
             continue
 
-        # MSG — informational messages worth showing in terminal
         m = re.match(r'^MSG:\d+,\d+,\d+,"([^"]*)"', line)
         if m and m.group(1).strip():
             print(f'    {m.group(1)}')
 
     proc.wait()
+    stop_event.set()
 
     if proc.returncode != 0:
         print(f'  ERROR: makemkvcon exited {proc.returncode}')

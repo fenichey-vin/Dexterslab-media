@@ -9,6 +9,8 @@ import re
 import sqlite3
 import json
 import time
+import shutil
+import threading
 import subprocess
 from pathlib import Path
 
@@ -231,11 +233,41 @@ def rip_title(device, title_num, output_dir, job_id=None):
     """
     output_dir = Path(output_dir)
 
+    # stdbuf forces line-buffering on makemkvcon so PRGV lines arrive promptly
+    cmd = ['makemkvcon', '-r', 'mkv', f'dev:{device}', str(title_num), str(output_dir)]
+    if shutil.which('stdbuf'):
+        cmd = ['stdbuf', '-oL'] + cmd
+
     proc = subprocess.Popen(
-        ['makemkvcon', '-r', 'mkv', f'dev:{device}', str(title_num), str(output_dir)],
+        cmd,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         text=True, bufsize=1
     )
+
+    prgv_seen   = [False]
+    stop_event  = threading.Event()
+    start_time  = time.time()
+
+    # Fallback: poll the growing output file so the dashboard always shows something
+    def _size_poll():
+        ESTIMATE = 25 * 60  # ~25 min cap; bar stops advancing at 95%
+        while not stop_event.wait(4):
+            if prgv_seen[0]:
+                return  # PRGV is working — hand off
+            try:
+                mkv_files = sorted(output_dir.glob('*.mkv'))
+                if not mkv_files:
+                    continue
+                size_gb = mkv_files[0].stat().st_size / (1024 ** 3)
+                elapsed = time.time() - start_time
+                pct     = min(int(elapsed / ESTIMATE * 100), 95)
+                _write_rip_progress(job_id, title_num, pct,
+                                    f'Ripping… {size_gb:.1f} GB written')
+            except Exception:
+                pass
+
+    if job_id:
+        threading.Thread(target=_size_poll, daemon=True).start()
 
     last_write = 0.0
     pct = 0
@@ -248,6 +280,7 @@ def rip_title(device, title_num, output_dir, job_id=None):
         if m:
             cur, mx = int(m.group(1)), int(m.group(2))
             pct = int(cur * 100 / mx) if mx else 0
+            prgv_seen[0] = True
             if job_id:
                 now = time.time()
                 if now - last_write >= 3:
@@ -260,6 +293,7 @@ def rip_title(device, title_num, output_dir, job_id=None):
             op = m.group(1)
 
     proc.wait()
+    stop_event.set()
 
     if proc.returncode != 0:
         if job_id:
