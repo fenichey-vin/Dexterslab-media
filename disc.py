@@ -238,6 +238,9 @@ def rip_title(device, title_num, output_dir, job_id=None):
     if shutil.which('stdbuf'):
         cmd = ['stdbuf', '-oL'] + cmd
 
+    if job_id:
+        _write_rip_progress(job_id, title_num, 0, 'Starting…')
+
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -251,7 +254,7 @@ def rip_title(device, title_num, output_dir, job_id=None):
     # Fallback: poll the growing output file so the dashboard always shows something
     def _size_poll():
         ESTIMATE = 25 * 60  # ~25 min cap; bar stops advancing at 95%
-        while not stop_event.wait(4):
+        while not stop_event.wait(2):
             if prgv_seen[0]:
                 return  # PRGV is working — hand off
             try:

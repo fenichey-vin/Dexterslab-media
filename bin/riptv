@@ -271,6 +271,8 @@ def rip_title(device, title_num, output_dir, job_id):
         text=True, bufsize=1
     )
 
+    _write_progress(job_id, title_num, 0, 'Starting…')
+
     prgv_seen        = [False]
     stop_event       = threading.Event()
     start_time       = time.time()
@@ -281,7 +283,7 @@ def rip_title(device, title_num, output_dir, job_id):
 
     def _size_poll():
         ESTIMATE = 25 * 60
-        while not stop_event.wait(4):
+        while not stop_event.wait(2):
             if prgv_seen[0]:
                 return
             try:
