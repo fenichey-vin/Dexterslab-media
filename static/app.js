@@ -272,7 +272,7 @@ function approveAndEncode(jobId) {
 
 function encodeJob(jobId, event) {
   if (event) { event.preventDefault(); event.stopPropagation(); }
-  if (!confirm('Start HandBrake encoding for this job? It will run in the background.')) return;
+  if (!confirm('Add this job to the encoding queue?')) return;
   apiPost(`/media/job/${jobId}/encode`, {})
     .then(r => {
       if (r.ok) {

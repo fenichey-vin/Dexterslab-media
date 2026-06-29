@@ -1,9 +1,11 @@
 {% extends "base.html" %}
 {% block title %}Dashboard — Media Intel{% endblock %}
 
-{% if active or encoding %}
+{% block head %}
+{% if active or encoding or enc_queue %}
 <meta http-equiv="refresh" content="5">
 {% endif %}
+{% endblock %}
 
 
 {% block content %}
@@ -68,6 +70,22 @@
   </h2>
   <div class="job-grid">
     {% for job in review %}
+    {% if job.title_count == 0 %}
+    <div class="job-card review job-card-with-action">
+      <a href="/media/job/{{ job.id }}" class="job-card-inner">
+        <div class="job-card-name">{{ job.name }}</div>
+        <div class="job-card-meta">
+          <span class="badge review">Classify Titles</span>
+          <span>0 titles</span>
+        </div>
+        {% if job.disc_label %}
+        <div class="job-card-disc">{{ job.disc_label }}</div>
+        {% endif %}
+        <div class="job-card-time">{{ job.created_at | reltime }}</div>
+      </a>
+      <button class="btn btn-remove" onclick="removeJob('{{ job.id }}', event)">✕ Remove</button>
+    </div>
+    {% else %}
     <a href="/media/job/{{ job.id }}" class="job-card review">
       <div class="job-card-name">{{ job.name }}</div>
       <div class="job-card-meta">
@@ -79,6 +97,7 @@
       {% endif %}
       <div class="job-card-time">{{ job.created_at | reltime }}</div>
     </a>
+    {% endif %}
     {% endfor %}
   </div>
 </section>
@@ -118,13 +137,48 @@
   </h2>
   <div class="job-grid">
     {% for job in encoding %}
+    {% set p = job.encode_progress %}
     <a href="/media/job/{{ job.id }}" class="job-card encoding">
       <div class="job-card-name">{{ job.name }}</div>
+      {% if p %}
+      <div class="enc-progress-wrap">
+        <div class="rip-track">
+          <div class="enc-fill" style="width:{{ p.pct }}%"></div>
+        </div>
+        <div class="rip-meta">
+          <span class="enc-pct">{{ "%.1f"|format(p.pct) }}%</span>
+          <span class="rip-op">
+            {{ p.title }}{% if p.total > 1 %} ({{ p.idx }}/{{ p.total }}){% endif %}{% if p.fps %} &middot; {{ "%.1f"|format(p.fps) }} fps{% endif %}{% if p.eta_secs %} &middot; ETA {{ p.eta_secs | eta_format }}{% endif %}
+          </span>
+        </div>
+      </div>
+      {% endif %}
       <div class="job-card-meta">
         <span class="badge encoding">Encoding…</span>
         <span>{{ job.title_count }} title{{ 's' if job.title_count != 1 else '' }}</span>
       </div>
-      <div class="job-card-time">{{ job.created_at | reltime }}</div>
+      <div class="job-card-time">{{ job.updated_at | reltime }}</div>
+    </a>
+    {% endfor %}
+  </div>
+</section>
+{% endif %}
+
+{% if enc_queue %}
+<section class="job-section">
+  <h2 class="section-title">
+    <span class="status-dot queued"></span>
+    Encode Queue ({{ enc_queue|length }})
+  </h2>
+  <div class="job-grid">
+    {% for job in enc_queue %}
+    <a href="/media/job/{{ job.id }}" class="job-card queued">
+      <div class="job-card-name">{{ job.name }}</div>
+      <div class="job-card-meta">
+        <span class="badge queued">#{{ loop.index }} In Queue</span>
+        <span>{{ job.title_count }} title{{ 's' if job.title_count != 1 else '' }}</span>
+      </div>
+      <div class="job-card-time">{{ job.updated_at | reltime }}</div>
     </a>
     {% endfor %}
   </div>
@@ -189,6 +243,15 @@
 
 {% block extra_js %}
 <script>
+function removeJob(jobId, event) {
+  if (event) { event.preventDefault(); event.stopPropagation(); }
+  if (!confirm('Remove this empty job?')) return;
+  fetch(`/media/job/${jobId}/delete`, { method: 'POST' })
+    .then(r => r.json())
+    .then(d => { if (d.ok) location.reload(); else alert('Error: ' + (d.error || 'unknown')); })
+    .catch(e => alert('Network error: ' + e));
+}
+
 function commitAll(jobId, event) {
   if (event) { event.preventDefault(); event.stopPropagation(); }
   if (!confirm('Move all staged files to the Jellyfin library?')) return;

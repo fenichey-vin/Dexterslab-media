@@ -10,6 +10,7 @@ import re
 import shutil
 import subprocess
 import threading
+import queue as _queue
 import time
 import urllib.request
 import urllib.error
@@ -29,6 +30,96 @@ from disc import detect_drives, scan_disc, flag_titles, rip_title, get_duration,
 app = Flask(__name__, static_url_path='/media/static')
 app.secret_key = 'mediaintel-change-in-production'
 app.config['MAX_CONTENT_LENGTH'] = None  # MKVs can be many GB
+
+# ── Encode queue (one job at a time) ─────────────────────────────────────────
+_encode_queue = _queue.Queue()
+
+def _encode_worker():
+    while True:
+        job_id = _encode_queue.get()
+        try:
+            _encode_job_bg(job_id)
+        except Exception:
+            pass
+        finally:
+            _encode_queue.task_done()
+
+threading.Thread(target=_encode_worker, daemon=True).start()
+
+
+def _startup_recovery():
+    """Recover jobs stuck in 'encoding' from a previous service run.
+
+    With KillMode=process in systemd, HandBrakeCLI survives a Flask restart.
+    On boot: if the process is still alive, wait for it then re-queue.
+    If it's dead, delete any partial staging files and re-queue immediately.
+    """
+    all_jobs = db.get_all_jobs()
+    stuck = [j for j in all_jobs if j['status'] == 'encoding']
+    if not stuck:
+        return
+
+    # Collect paths that are legitimately complete (referenced in titles.staged_path)
+    legitimate_staged = set()
+    for j in all_jobs:
+        for t in db.get_titles(j['id']):
+            if t.get('staged_path'):
+                legitimate_staged.add(t['staged_path'])
+
+    # Identify live orphaned HandBrake processes and the files they're writing
+    active_output_files = set()
+    live_pid_by_job = {}
+    for job in stuck:
+        progress = job.get('encode_progress')
+        pid = progress.get('pid') if isinstance(progress, dict) else None
+        if not pid:
+            continue
+        try:
+            os.kill(pid, 0)
+            cmdline = Path(f'/proc/{pid}/cmdline').read_bytes()
+            if b'HandBrakeCLI' not in cmdline:
+                continue
+            parts = cmdline.split(b'\x00')
+            for i, part in enumerate(parts):
+                if part == b'-o' and i + 1 < len(parts):
+                    active_output_files.add(parts[i + 1].decode('utf-8', errors='replace'))
+            live_pid_by_job[job['id']] = pid
+        except Exception:
+            pass
+
+    # Delete partial staging files — not legitimately complete, not actively written
+    for p in STAGING_DIR.glob('*.mkv'):
+        if str(p) not in legitimate_staged and str(p) not in active_output_files:
+            try:
+                p.unlink()
+                print(f'[recovery] removed partial staging file: {p.name}')
+            except Exception:
+                pass
+
+    for job in stuck:
+        job_id = job['id']
+        if job_id in live_pid_by_job:
+            pid = live_pid_by_job[job_id]
+            print(f'[recovery] job {job_id}: HandBrake PID {pid} still running — monitoring')
+
+            def _watch(jid=job_id, p=pid):
+                while True:
+                    try:
+                        os.kill(p, 0)
+                        time.sleep(10)
+                    except (ProcessLookupError, PermissionError):
+                        break
+                print(f'[recovery] PID {p} finished — re-queuing {jid}')
+                db.set_encode_progress(jid, None)
+                db.set_job_status(jid, 'approved')
+                _encode_queue.put(jid)
+
+            threading.Thread(target=_watch, daemon=True).start()
+        else:
+            print(f'[recovery] job {job_id}: no live HandBrake — re-queuing')
+            db.set_encode_progress(job_id, None)
+            db.set_job_status(job_id, 'approved')
+            _encode_queue.put(job_id)
 
 
 # ── Template filters ─────────────────────────────────────────────────────────
@@ -67,6 +158,18 @@ def fmt_size(b):
     return f'{b:.1f} PB'
 
 
+@app.template_filter('eta_format')
+def fmt_eta(secs):
+    if not secs:
+        return ''
+    secs = int(secs)
+    h, rem = divmod(secs, 3600)
+    m = rem // 60
+    if h:
+        return f'{h}h {m:02d}m'
+    return f'{m}m'
+
+
 @app.template_filter('reltime')
 def fmt_reltime(iso):
     try:
@@ -90,14 +193,16 @@ def dashboard():
     active    = [j for j in all_jobs if j['status'] == 'ingesting']
     review    = [j for j in all_jobs if j['status'] == 'review']
     approved  = [j for j in all_jobs if j['status'] == 'approved']
+    enc_queue = [j for j in all_jobs if j['status'] == 'queued']
     encoding  = [j for j in all_jobs if j['status'] == 'encoding']
     staged    = [j for j in all_jobs if j['status'] == 'staged']
     completed = [j for j in all_jobs if j['status'] in ('complete', 'error')]
     total_titles = sum(j['title_count'] for j in all_jobs)
     return render_template('dashboard.html',
                            active=active, review=review,
-                           approved=approved, encoding=encoding,
-                           staged=staged, completed=completed,
+                           approved=approved, enc_queue=enc_queue,
+                           encoding=encoding, staged=staged,
+                           completed=completed,
                            total_titles=total_titles,
                            now=time.time())
 
@@ -151,12 +256,11 @@ def approve_job(job_id):
         return jsonify({'error': str(e)}), 500
     db.set_job_status(job_id, 'approved')
 
-    # Optional: immediately start encoding when auto_encode=True
+    # Optional: immediately queue encoding when auto_encode=True
     auto_encode = (request.get_json(silent=True) or {}).get('auto_encode', False)
     if auto_encode:
-        db.set_job_status(job_id, 'encoding')
-        t = threading.Thread(target=_encode_job_bg, args=(job_id,), daemon=True)
-        t.start()
+        db.set_job_status(job_id, 'queued')
+        _encode_queue.put(job_id)
 
     return jsonify({'ok': True, 'path': str(out_path)})
 
@@ -217,7 +321,18 @@ def export_json(job_id):
 
 @app.route('/media/job/<job_id>/delete', methods=['POST'])
 def delete_job(job_id):
-    db.delete_job(job_id)
+    job = db.get_job(job_id)
+    if job:
+        titles = db.get_titles(job_id)
+        review_path = Path(job['review_path'])
+        db.delete_job(job_id)
+        if not titles and review_path.exists():
+            try:
+                shutil.rmtree(str(review_path))
+            except Exception:
+                pass
+    else:
+        db.delete_job(job_id)
     return jsonify({'ok': True})
 
 
@@ -228,13 +343,12 @@ def start_encode(job_id):
     job = db.get_job(job_id)
     if not job:
         return jsonify({'error': 'Not found'}), 404
-    if job['status'] == 'encoding':
-        return jsonify({'error': 'Already encoding'}), 400
+    if job['status'] in ('encoding', 'queued'):
+        return jsonify({'error': 'Already encoding or queued'}), 400
     if job['status'] != 'approved':
         return jsonify({'error': f'Job must be approved first (currently: {job["status"]})'}), 400
-    db.set_job_status(job_id, 'encoding')
-    t = threading.Thread(target=_encode_job_bg, args=(job_id,), daemon=True)
-    t.start()
+    db.set_job_status(job_id, 'queued')
+    _encode_queue.put(job_id)
     return jsonify({'ok': True})
 
 
@@ -262,7 +376,9 @@ def commit_title(job_id, n):
     if dest is None:
         return jsonify({'error': 'This type is skipped (play_all/deleted/unknown)'}), 400
 
-    dest = _unique_path(dest)
+    if dest.exists():
+        return jsonify({'error': f'File already exists in library: {dest.name} — delete it first if you want to replace it'}), 409
+
     dest.parent.mkdir(parents=True, exist_ok=True)
     try:
         shutil.move(str(staged), str(dest))
@@ -293,7 +409,9 @@ def commit_all(job_id):
         dest = _route_library(cls, n)
         if dest is None:
             continue
-        dest = _unique_path(dest)
+        if dest.exists():
+            errors.append(f'title_{n}: already in library ({dest.name}) — delete it first')
+            continue
         dest.parent.mkdir(parents=True, exist_ok=True)
         try:
             shutil.move(str(path), str(dest))
@@ -382,11 +500,66 @@ def _unique_path(path):
         i += 1
 
 
+def _run_handbrake(cmd, job_id, title_name, title_idx, title_total):
+    """Run HandBrakeCLI and stream progress from stderr into encode_progress."""
+    pct_re = re.compile(rb'(\d+\.\d+)\s*%')
+    fps_re = re.compile(rb'avg\s+([\d.]+)\s*fps')
+    eta_re = re.compile(rb'ETA\s+(\d+)h(\d+)m(\d+)s')
+
+    proc = subprocess.Popen(
+        cmd, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL,
+        start_new_session=True,  # detach from Flask — survives service restart
+    )
+    # Store PID immediately so startup recovery can find this process
+    db.set_encode_progress(job_id, {
+        'pct': 0.0, 'fps': 0.0, 'eta_secs': 0,
+        'title': title_name, 'idx': title_idx, 'total': title_total,
+        'ts': time.time(), 'pid': proc.pid,
+    })
+    last_save = [0.0]
+
+    def _reader():
+        buf = b''
+        while True:
+            try:
+                chunk = proc.stderr.read1(4096)
+            except Exception:
+                break
+            if not chunk:
+                break
+            buf = (buf + chunk)[-2048:]
+            now = time.time()
+            if now - last_save[0] < 3.0:
+                continue
+            m_pct = pct_re.search(buf)
+            if not m_pct:
+                continue
+            pct = float(m_pct.group(1))
+            m_fps = fps_re.search(buf)
+            m_eta = eta_re.search(buf)
+            fps = float(m_fps.group(1)) if m_fps else 0.0
+            eta = (int(m_eta.group(1)) * 3600 + int(m_eta.group(2)) * 60 + int(m_eta.group(3))) if m_eta else 0
+            db.set_encode_progress(job_id, {
+                'pct': round(pct, 1), 'fps': round(fps, 1), 'eta_secs': eta,
+                'title': title_name, 'idx': title_idx, 'total': title_total,
+                'ts': now, 'pid': proc.pid,
+            })
+            last_save[0] = now
+
+    t = threading.Thread(target=_reader, daemon=True)
+    t.start()
+    proc.wait()
+    t.join(timeout=5)
+    return proc.returncode
+
+
 def _encode_job_bg(job_id):
-    """Background thread: HandBrake-encode all titles into the staging folder."""
+    """Encode all titles for one job into staging, one at a time with progress."""
     job = db.get_job(job_id)
     if not job:
         return
+
+    db.set_job_status(job_id, 'encoding')
 
     job_dir  = Path(job['review_path'])
     cls_file = job_dir / 'classification.json'
@@ -406,42 +579,62 @@ def _encode_job_bg(job_id):
     with open(cls_file) as f:
         classifications = json.load(f)
 
-    _log(f'=== Encode start (staging): {job["name"]} ({job_id}) ===')
-    ok = fail = 0
-
+    # Build list of encodable titles up front for total count
+    encodable = []
     for key, cls in sorted(classifications.items()):
         m = re.match(r'^title_(\d+)$', key)
         if not m:
             continue
-        title_num = int(m.group(1))
-
         if cls.get('type') in ('play_all', 'deleted', 'unknown'):
             continue
+        encodable.append((int(m.group(1)), cls))
 
+    _log(f'=== Encode start (staging): {job["name"]} ({job_id}) — {len(encodable)} titles ===')
+    ok = fail = 0
+
+    for title_idx, (title_num, cls) in enumerate(encodable):
         title_dir = job_dir / f'title_{title_num}'
         mkv_files = sorted(title_dir.glob('*.mkv'))
         if not mkv_files:
-            _log(f'FAIL {job_id} {key}: MKV missing')
+            _log(f'FAIL {job_id} title_{title_num}: MKV missing')
             fail += 1
             continue
 
-        output_path = _unique_path(_route_staging(cls, title_num))
-        if output_path is None:
+        staging_path = _route_staging(cls, title_num)
+        if staging_path is None:
             continue
 
-        result = subprocess.run([
-            'HandBrakeCLI', '-i', str(mkv_files[0]), '-t', '1',
-            '-o', str(output_path), '--preset', HB_PRESET,
-            *HB_FILTERS, *HB_AUDIO
-        ])
-
-        if result.returncode == 0:
+        # Skip — don't create _2 duplicates — if this filename already landed
+        # in staging from a different job for the same content.
+        if staging_path.exists():
+            _log(f'SKIP {job_id} title_{title_num}: staging file already exists ({staging_path.name})')
             ok += 1
-            db.update_title(job_id, title_num, staged_path=str(output_path))
-            _log(f'OK   {job_id} {key}: {output_path}')
+            db.update_title(job_id, title_num, staged_path=str(staging_path))
+            continue
+
+        title_name = staging_path.stem
+        db.set_encode_progress(job_id, {
+            'pct': 0.0, 'fps': 0.0, 'eta_secs': 0,
+            'title': title_name, 'idx': title_idx + 1, 'total': len(encodable),
+            'ts': time.time(),
+        })
+
+        cmd = [
+            'HandBrakeCLI', '-i', str(mkv_files[0]), '-t', '1',
+            '-o', str(staging_path), '--preset', HB_PRESET,
+            *HB_FILTERS, *HB_AUDIO,
+        ]
+        rc = _run_handbrake(cmd, job_id, title_name, title_idx + 1, len(encodable))
+
+        if rc == 0:
+            ok += 1
+            db.update_title(job_id, title_num, staged_path=str(staging_path))
+            _log(f'OK   {job_id} title_{title_num}: {staging_path}')
         else:
             fail += 1
-            _log(f'FAIL {job_id} {key}: HandBrakeCLI error')
+            _log(f'FAIL {job_id} title_{title_num}: HandBrakeCLI error (rc={rc})')
+
+    db.set_encode_progress(job_id, None)
 
     if fail == 0:
         db.set_job_status(job_id, 'staged')
@@ -1043,5 +1236,6 @@ def health():
 
 if __name__ == '__main__':
     db.init_db()
+    _startup_recovery()
     print(f'Media Intel Dashboard → http://0.0.0.0:{PORT}/media')
     app.run(host='0.0.0.0', port=PORT, debug=False, threaded=True)

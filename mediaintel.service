@@ -9,6 +9,7 @@ WorkingDirectory=/home/vinnie/mediaintel
 ExecStart=/usr/bin/python3 /home/vinnie/mediaintel/app.py
 Restart=on-failure
 RestartSec=5
+KillMode=process
 StandardOutput=journal
 StandardError=journal
 Environment=PYTHONUNBUFFERED=1

@@ -14,18 +14,19 @@ PRAGMA foreign_keys = ON;
 PRAGMA journal_mode = WAL;
 
 CREATE TABLE IF NOT EXISTS jobs (
-    id           TEXT PRIMARY KEY,
-    name         TEXT NOT NULL,
-    status       TEXT NOT NULL DEFAULT 'ingesting',
-    disc_label   TEXT,
-    drive        TEXT,
-    review_path  TEXT NOT NULL,
-    title_count  INTEGER NOT NULL DEFAULT 0,
-    created_at   TEXT NOT NULL,
-    updated_at   TEXT NOT NULL,
-    notes        TEXT,
-    disc_context TEXT,
-    rip_progress TEXT
+    id              TEXT PRIMARY KEY,
+    name            TEXT NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'ingesting',
+    disc_label      TEXT,
+    drive           TEXT,
+    review_path     TEXT NOT NULL,
+    title_count     INTEGER NOT NULL DEFAULT 0,
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL,
+    notes           TEXT,
+    disc_context    TEXT,
+    rip_progress    TEXT,
+    encode_progress TEXT
 );
 
 CREATE TABLE IF NOT EXISTS titles (
@@ -87,6 +88,10 @@ def init_db():
             conn.execute('ALTER TABLE jobs ADD COLUMN rip_progress TEXT')
         except Exception:
             pass
+        try:
+            conn.execute('ALTER TABLE jobs ADD COLUMN encode_progress TEXT')
+        except Exception:
+            pass
 
 
 def _now():
@@ -143,6 +148,11 @@ def _parse_job(row):
             j['rip_progress'] = json.loads(j['rip_progress'])
         except Exception:
             j['rip_progress'] = None
+    if j.get('encode_progress'):
+        try:
+            j['encode_progress'] = json.loads(j['encode_progress'])
+        except Exception:
+            j['encode_progress'] = None
     return j
 
 
@@ -163,6 +173,15 @@ def set_rip_progress(job_id, progress):
     with _db() as conn:
         conn.execute(
             'UPDATE jobs SET rip_progress=? WHERE id=?',
+            (json.dumps(progress) if progress else None, job_id)
+        )
+
+
+def set_encode_progress(job_id, progress):
+    """Write or clear encode progress. progress=dict or None to clear."""
+    with _db() as conn:
+        conn.execute(
+            'UPDATE jobs SET encode_progress=? WHERE id=?',
             (json.dumps(progress) if progress else None, job_id)
         )
 
