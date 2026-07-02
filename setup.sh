@@ -12,8 +12,10 @@ apt-get install -y python3-flask
 
 # 2. Create media directories
 echo "[2/5] Creating media directories..."
-mkdir -p /srv/media/review /srv/media/inbox /srv/media/specials
-chown vinnie:vinnie /srv/media/review /srv/media/inbox /srv/media/specials
+mkdir -p /srv/media/tv /srv/media/movies /srv/media/specials
+mkdir -p /srv/work/review /srv/work/inbox /srv/work/queue /srv/work/staging
+chown vinnie:vinnie /srv/media/tv /srv/media/movies /srv/media/specials
+chown vinnie:vinnie /srv/work/review /srv/work/inbox /srv/work/queue /srv/work/staging
 
 # 3. Install scripts to /usr/local/bin
 echo "[3/5] Installing scripts..."

@@ -105,9 +105,9 @@
 
 {% if approved %}
 <section class="job-section">
-  <h2 class="section-title">
-    <span class="status-dot approved"></span>
-    Ready to Encode ({{ approved|length }})
+  <h2 class="section-title" style="display:flex;align-items:center;justify-content:space-between">
+    <span><span class="status-dot approved"></span>Ready to Encode ({{ approved|length }})</span>
+    <button class="btn btn-encode" onclick="encodeAll(event)" style="font-size:0.8rem;padding:4px 12px">▶ Encode All</button>
   </h2>
   <div class="job-grid">
     {% for job in approved %}
@@ -247,6 +247,15 @@ function removeJob(jobId, event) {
   if (event) { event.preventDefault(); event.stopPropagation(); }
   if (!confirm('Remove this empty job?')) return;
   fetch(`/media/job/${jobId}/delete`, { method: 'POST' })
+    .then(r => r.json())
+    .then(d => { if (d.ok) location.reload(); else alert('Error: ' + (d.error || 'unknown')); })
+    .catch(e => alert('Network error: ' + e));
+}
+
+function encodeAll(event) {
+  if (event) { event.preventDefault(); event.stopPropagation(); }
+  if (!confirm('Queue all {{ approved|length }} approved job(s) for encoding?')) return;
+  fetch('/media/encode-all', { method: 'POST' })
     .then(r => r.json())
     .then(d => { if (d.ok) location.reload(); else alert('Error: ' + (d.error || 'unknown')); })
     .catch(e => alert('Network error: ' + e));

@@ -338,6 +338,16 @@ def delete_job(job_id):
 
 # ── Encode ───────────────────────────────────────────────────────────────────
 
+@app.route('/media/encode-all', methods=['POST'])
+def encode_all():
+    all_jobs = db.get_all_jobs()
+    approved = [j for j in all_jobs if j['status'] == 'approved']
+    for job in approved:
+        db.set_job_status(job['id'], 'queued')
+        _encode_queue.put(job['id'])
+    return jsonify({'ok': True, 'queued': len(approved)})
+
+
 @app.route('/media/job/<job_id>/encode', methods=['POST'])
 def start_encode(job_id):
     job = db.get_job(job_id)
@@ -569,7 +579,7 @@ def _encode_job_bg(job_id):
         return
 
     STAGING_DIR.mkdir(parents=True, exist_ok=True)
-    log_path = Path('/srv/media/encode_log.txt')
+    log_path = Path('/srv/work/logs/encode_log.txt')
 
     def _log(msg):
         ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')

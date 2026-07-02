@@ -25,7 +25,7 @@ sys.path.insert(0, '/home/vinnie/mediaintel')
 from config import (REVIEW_DIR, TV_DIR, MOVIES_DIR, SPECIALS_DIR,
                     DB_PATH, HB_PRESET, HB_FILTERS, HB_AUDIO)
 
-LOG_FILE = Path('/srv/media/encode_log.txt')
+LOG_FILE = Path('/srv/work/logs/encode_log.txt')
 
 
 # ── DB helpers ─────────────────────────────────────────────────────────────────

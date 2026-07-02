@@ -2,15 +2,18 @@ import os
 from pathlib import Path
 
 BASE_DIR = Path(os.path.dirname(os.path.abspath(__file__)))
-MEDIA_ROOT = Path('/srv/media')
 
-REVIEW_DIR   = MEDIA_ROOT / 'review'
-INBOX_DIR    = MEDIA_ROOT / 'inbox'
+MEDIA_ROOT = Path('/srv/media')
+WORK_ROOT  = Path('/srv/work')
+
+REVIEW_DIR   = WORK_ROOT / 'review'
+INBOX_DIR    = WORK_ROOT / 'inbox'
+QUEUE_DIR    = WORK_ROOT / 'queue'
+STAGING_DIR  = WORK_ROOT / 'staging'
+
 TV_DIR       = MEDIA_ROOT / 'tv'
 MOVIES_DIR   = MEDIA_ROOT / 'movies'
 SPECIALS_DIR = MEDIA_ROOT / 'specials'
-QUEUE_DIR    = MEDIA_ROOT / 'queue'
-STAGING_DIR  = MEDIA_ROOT / 'staging'
 
 DB_PATH = BASE_DIR / 'mediaintel.db'
 PORT    = 8088
