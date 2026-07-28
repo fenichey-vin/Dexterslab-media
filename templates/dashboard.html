@@ -202,9 +202,14 @@
         </div>
         <div class="job-card-time">{{ job.created_at | reltime }}</div>
       </a>
-      <button class="btn btn-commit" onclick="commitAll('{{ job.id }}', event)">
-        ✓ Commit All
-      </button>
+      <div style="display:flex;flex-direction:column;gap:6px;flex-shrink:0">
+        <button class="btn btn-commit" onclick="commitAll('{{ job.id }}', event)">
+          ✓ Commit All
+        </button>
+        <button class="btn btn-discard" onclick="discardAllStaged('{{ job.id }}', event)">
+          🗑 Discard All
+        </button>
+      </div>
     </div>
     {% endfor %}
   </div>
@@ -269,6 +274,23 @@ function commitAll(jobId, event) {
     .then(d => {
       if (d.ok) {
         const msg = `Committed ${d.committed} file(s).` + (d.errors.length ? '\nErrors:\n' + d.errors.join('\n') : '');
+        alert(msg);
+        location.reload();
+      } else {
+        alert('Error: ' + (d.error || 'unknown'));
+      }
+    })
+    .catch(e => alert('Network error: ' + e));
+}
+
+function discardAllStaged(jobId, event) {
+  if (event) { event.preventDefault(); event.stopPropagation(); }
+  if (!confirm('Permanently delete ALL staged files for this job? This cannot be undone.')) return;
+  fetch(`/media/job/${jobId}/discard-staged`, { method: 'POST' })
+    .then(r => r.json())
+    .then(d => {
+      if (d.ok) {
+        const msg = `Discarded ${d.discarded} file(s).` + (d.errors.length ? '\nErrors:\n' + d.errors.join('\n') : '');
         alert(msg);
         location.reload();
       } else {

@@ -42,16 +42,29 @@ function showForm(n, type) {
   // the whole form returns the first match, which is always the TV fieldset.
   const activeFieldset = qs(`fields-${sets[type]}-${n}`);
   const sugg = (_state[n] || {}).claudeSuggestion;
+  const existingRaw = wrap && wrap.dataset.cls;
+
   if (sugg && sugg.type === type) {
     _prefillForm(activeFieldset, sugg);
+  } else if (existingRaw) {
+    try { _prefillForm(activeFieldset, JSON.parse(existingRaw)); } catch(e) {}
   } else {
-    const existingRaw = wrap && wrap.dataset.cls;
-    if (existingRaw) {
-      try { _prefillForm(activeFieldset, JSON.parse(existingRaw)); } catch(e) {}
-    }
+    // Nothing title-specific yet — fall back to what the disc context
+    // already knows (e.g. a single-movie disc knows its title/year for
+    // every title on it), so the user only has to verify, not retype.
+    _prefillFromDiscContext(activeFieldset, type);
   }
 
   wrap.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+function _prefillFromDiscContext(container, type) {
+  if (typeof DISC_CONTEXT === 'undefined' || !DISC_CONTEXT || !container) return;
+  if (type === 'movie' && DISC_CONTEXT.type === 'movie') {
+    _prefillForm(container, { movie_title: DISC_CONTEXT.title, year: DISC_CONTEXT.year });
+  } else if (type === 'tv_episode' && DISC_CONTEXT.type === 'tv') {
+    _prefillForm(container, { show: DISC_CONTEXT.show, season: DISC_CONTEXT.season });
+  }
 }
 
 function hideForm(n) {
@@ -283,3 +296,66 @@ function encodeJob(jobId, event) {
     })
     .catch(e => alert('Network error: ' + e));
 }
+
+// ── Global "already ripped?" search ──────────────────────────────────────────
+
+(function () {
+  const input = qs('global-search-input');
+  const panel = qs('global-search-results');
+  if (!input || !panel) return;
+
+  const STATUS_LABEL = {
+    ingesting: 'ripping', review: 'in review', approved: 'approved',
+    queued: 'queued', encoding: 'encoding', staged: 'staged',
+    complete: 'in library', error: 'error'
+  };
+
+  let debounceTimer;
+  input.addEventListener('input', () => {
+    clearTimeout(debounceTimer);
+    const q = input.value.trim();
+    if (q.length < 2) { hide(panel); panel.innerHTML = ''; return; }
+    debounceTimer = setTimeout(() => runSearch(q), 250);
+  });
+
+  input.addEventListener('focus', () => {
+    if (panel.innerHTML.trim()) show(panel);
+  });
+
+  document.addEventListener('click', e => {
+    if (e.target !== input && !panel.contains(e.target)) hide(panel);
+  });
+
+  function runSearch(q) {
+    fetch(`/media/search.json?q=${encodeURIComponent(q)}`)
+      .then(r => r.json())
+      .then(d => renderResults(d.results || []))
+      .catch(() => {});
+  }
+
+  function renderResults(results) {
+    if (!results.length) {
+      panel.innerHTML = '<div class="search-empty">No matches — probably not ripped yet</div>';
+      show(panel);
+      return;
+    }
+    panel.innerHTML = results.map(r => {
+      const statusText = r.discarded ? 'discarded' : (r.staged ? 'staged' : (STATUS_LABEL[r.job_status] || r.job_status));
+      return `
+        <a class="search-result" href="/media/job/${r.job_id}">
+          <span class="search-result-label">${_esc(r.label)}</span>
+          <span class="search-result-meta">
+            <span class="badge ${r.discarded ? 'error' : r.job_status}">${_esc(statusText)}</span>
+            ${r.disc_label ? `<span class="search-result-disc">${_esc(r.disc_label)}</span>` : ''}
+          </span>
+        </a>`;
+    }).join('');
+    show(panel);
+  }
+
+  function _esc(s) {
+    const d = document.createElement('div');
+    d.textContent = s;
+    return d.innerHTML;
+  }
+})();

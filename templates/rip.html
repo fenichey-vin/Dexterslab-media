@@ -362,16 +362,25 @@ function _buildTitlesTable(titles) {
   const tbody = document.getElementById('titles-tbody');
   tbody.innerHTML = '';
 
-  titles.forEach(t => {
-    const isPlayAll = (t.flags || []).includes('play_all');
-    const checked   = !isPlayAll;  // play_all unchecked by default
+  // Movie discs are usually one full-length feature plus a pile of short
+  // junk (trailers, previews, menu loops) — the outlier-duration heuristic
+  // that flags "play_all" actually catches the feature itself in that case
+  // (it's just much longer than the median short junk title), so for a
+  // movie disc we want the opposite default: keep the long one, skip the
+  // short ones. TV discs keep the original default (skip play_all, keep
+  // the rest — those are the individual episodes).
+  const discType = document.querySelector('input[name="ctx-type"]:checked')?.value;
 
-    const flagsHtml = (t.flags || []).map(f =>
+  titles.forEach(t => {
+    const flags   = t.flags || [];
+    const checked = discType === 'movie' ? !flags.includes('short') : !flags.includes('play_all');
+
+    const flagsHtml = flags.map(f =>
       `<span class="flag flag-${f}">${f.replace(/_/g,' ')}</span>`
     ).join('');
 
     const tr = document.createElement('tr');
-    if (isPlayAll) tr.classList.add('rip-skipped');
+    if (!checked) tr.classList.add('rip-skipped');
     tr.innerHTML = `
       <td><input type="checkbox" class="title-check" data-num="${t.num}"
                  ${checked ? 'checked' : ''} onchange="updateRipCount()"></td>
@@ -382,9 +391,11 @@ function _buildTitlesTable(titles) {
     tbody.appendChild(tr);
   });
 
-  // Sync "check all" state
-  document.getElementById('check-all').checked =
-    titles.length > 0 && titles.every(t => !(t.flags||[]).includes('play_all'));
+  // Sync "check all" state from what actually got checked above
+  const checks = [...tbody.querySelectorAll('.title-check')];
+  const checkAll = document.getElementById('check-all');
+  checkAll.checked = checks.length > 0 && checks.every(c => c.checked);
+  checkAll.indeterminate = checks.some(c => c.checked) && !checkAll.checked;
 }
 
 function toggleAll(checked) {

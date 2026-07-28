@@ -34,6 +34,9 @@
     <button class="btn btn-commit" onclick="commitAll('{{ job.id }}')">
       ✓ Commit All to Library
     </button>
+    <button class="btn btn-discard" onclick="discardAllStaged('{{ job.id }}')">
+      🗑 Discard All Staged
+    </button>
     {% endif %}
   </div>
 </div>
@@ -211,6 +214,9 @@
       <button class="btn-commit" onclick="commitTitle({{ t.title_num }})">
         Move to Library
       </button>
+      <button class="btn-discard-title" onclick="discardTitle({{ t.title_num }})">
+        🗑 Discard
+      </button>
     </div>
     {% endif %}
 
@@ -343,6 +349,7 @@
 
 <script>
   const JOB_ID = '{{ job.id }}';
+  const DISC_CONTEXT = {{ job.disc_context | tojson }};
 
   // ── Disc context panel ─────────────────────────────────────────────────────
 
@@ -446,6 +453,37 @@
       .then(d => {
         if (d.ok) {
           const msg = `Committed ${d.committed} file(s).` + (d.errors.length ? '\nErrors:\n' + d.errors.join('\n') : '');
+          alert(msg);
+          location.reload();
+        } else {
+          alert('Error: ' + (d.error || 'unknown'));
+        }
+      })
+      .catch(e => alert('Network error: ' + e));
+  }
+
+  function discardTitle(n) {
+    if (!confirm('Permanently delete this staged encode? This cannot be undone.')) return;
+    fetch(`/media/job/${JOB_ID}/title/${n}/discard`, { method: 'POST' })
+      .then(r => r.json())
+      .then(d => {
+        if (d.ok) {
+          const row = document.getElementById('staged-row-' + n);
+          if (row) row.remove();
+        } else {
+          alert('Error: ' + (d.error || 'unknown'));
+        }
+      })
+      .catch(e => alert('Network error: ' + e));
+  }
+
+  function discardAllStaged(jobId) {
+    if (!confirm('Permanently delete ALL staged files for this job? This cannot be undone.')) return;
+    fetch(`/media/job/${jobId}/discard-staged`, { method: 'POST' })
+      .then(r => r.json())
+      .then(d => {
+        if (d.ok) {
+          const msg = `Discarded ${d.discarded} file(s).` + (d.errors.length ? '\nErrors:\n' + d.errors.join('\n') : '');
           alert(msg);
           location.reload();
         } else {

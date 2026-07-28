@@ -440,8 +440,139 @@ def _maybe_complete_staged_job(job_id):
         db.set_job_status(job_id, 'complete')
 
 
+def _is_within(path, root):
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+# ── Discard staged files (encoded but not committed to the library) ──────────
+
+@app.route('/media/job/<job_id>/title/<int:n>/discard', methods=['POST'])
+def discard_staged_title(job_id, n):
+    title = db.get_title(job_id, n)
+    if not title:
+        return jsonify({'error': 'Title not found'}), 404
+
+    staged_path = title.get('staged_path')
+    if not staged_path:
+        return jsonify({'error': 'Title has no staged file'}), 400
+
+    p = Path(staged_path)
+    if not _is_within(p, STAGING_DIR):
+        return jsonify({'error': 'Refusing to delete a file outside the staging dir'}), 400
+
+    try:
+        if p.exists():
+            p.unlink()
+    except OSError as e:
+        return jsonify({'error': str(e)}), 500
+
+    flags = title.get('flags') or []
+    if 'discarded' not in flags:
+        flags = flags + ['discarded']
+    db.update_title(job_id, n, staged_path=None, flags=flags)
+    _maybe_complete_staged_job(job_id)
+    return jsonify({'ok': True})
+
+
+@app.route('/media/job/<job_id>/discard-staged', methods=['POST'])
+def discard_all_staged(job_id):
+    titles = db.get_titles(job_id)
+    staged = [t for t in titles if t.get('staged_path')]
+    if not staged:
+        return jsonify({'error': 'No staged titles to discard'}), 400
+
+    ok_count = 0
+    errors   = []
+    for t in staged:
+        n = t['title_num']
+        p = Path(t['staged_path'])
+        if not _is_within(p, STAGING_DIR):
+            errors.append(f'title_{n}: refusing to delete file outside staging dir')
+            continue
+        try:
+            if p.exists():
+                p.unlink()
+            flags = t.get('flags') or []
+            if 'discarded' not in flags:
+                flags = flags + ['discarded']
+            db.update_title(job_id, n, staged_path=None, flags=flags)
+            ok_count += 1
+        except OSError as e:
+            errors.append(f'title_{n}: {e}')
+
+    _maybe_complete_staged_job(job_id)
+    return jsonify({'ok': True, 'discarded': ok_count, 'errors': errors})
+
+
 def _safe_name(name):
     return re.sub(r'[<>:"/\\|?*]', '', str(name)).strip('. ')
+
+
+def _cls_label(cls, title_num):
+    """Human-readable one-liner for a classification, used in search results."""
+    if not cls:
+        return f'title_{title_num}'
+    t = cls.get('type', 'unknown')
+    if t == 'tv_episode':
+        label = cls.get('show') or 'Unknown Show'
+        season, ep = cls.get('season'), cls.get('episode')
+        if season:
+            label += f' S{int(season):02d}'
+        if ep:
+            label += f'E{int(ep):02d}'
+        if cls.get('episode_title'):
+            label += f' — {cls["episode_title"]}'
+        return label
+    if t in ('movie', 'documentary'):
+        label = cls.get('movie_title') or cls.get('title') or 'Unknown Title'
+        return f'{label} ({cls["year"]})' if cls.get('year') else label
+    if t == 'special':
+        show  = cls.get('show') or 'Misc'
+        title = cls.get('title') or f'title_{title_num}'
+        return f'{show} — {title}'
+    return t.replace('_', ' ').title()
+
+
+# ── Search (avoid re-ripping something already in the library) ──────────────
+
+@app.route('/media/search.json')
+def search_json():
+    q = (request.args.get('q') or '').strip().lower()
+    if len(q) < 2:
+        return jsonify({'results': []})
+
+    results = []
+    for job in db.get_all_jobs():
+        for t in db.get_titles(job['id']):
+            cls = t.get('classification')
+            if not cls:
+                continue
+            label = _cls_label(cls, t['title_num'])
+            haystack = ' '.join(str(v) for v in [
+                job.get('name') or '', job.get('disc_label') or '',
+                cls.get('show') or '', cls.get('movie_title') or '',
+                cls.get('title') or '', cls.get('episode_title') or '',
+                label,
+            ]).lower()
+            if q not in haystack:
+                continue
+            results.append({
+                'job_id':      job['id'],
+                'title_num':   t['title_num'],
+                'label':       label,
+                'type':        cls.get('type'),
+                'job_status':  job['status'],
+                'disc_label':  job.get('disc_label'),
+                'discarded':   'discarded' in (t.get('flags') or []),
+                'staged':      bool(t.get('staged_path')),
+            })
+
+    results.sort(key=lambda r: r['label'])
+    return jsonify({'results': results[:40]})
 
 
 def _route_library(cls, title_num):
