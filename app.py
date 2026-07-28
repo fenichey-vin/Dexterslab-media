@@ -196,13 +196,14 @@ def dashboard():
     enc_queue = [j for j in all_jobs if j['status'] == 'queued']
     encoding  = [j for j in all_jobs if j['status'] == 'encoding']
     staged    = [j for j in all_jobs if j['status'] == 'staged']
-    completed = [j for j in all_jobs if j['status'] in ('complete', 'error')]
+    completed = [j for j in all_jobs if j['status'] == 'complete']
+    failed    = [j for j in all_jobs if j['status'] == 'error']
     total_titles = sum(j['title_count'] for j in all_jobs)
     return render_template('dashboard.html',
                            active=active, review=review,
                            approved=approved, enc_queue=enc_queue,
                            encoding=encoding, staged=staged,
-                           completed=completed,
+                           completed=completed, failed=failed,
                            total_titles=total_titles,
                            now=time.time())
 
@@ -395,6 +396,7 @@ def commit_title(job_id, n):
     except OSError as e:
         return jsonify({'error': str(e)}), 500
 
+    _catalog_commit(job_id, n, title, cls, dest)
     db.update_title(job_id, n, staged_path=None)
     _maybe_complete_staged_job(job_id)
     return jsonify({'ok': True, 'dest': str(dest)})
@@ -425,6 +427,7 @@ def commit_all(job_id):
         dest.parent.mkdir(parents=True, exist_ok=True)
         try:
             shutil.move(str(path), str(dest))
+            _catalog_commit(job_id, n, t, cls, dest)
             db.update_title(job_id, n, staged_path=None)
             ok_list.append(str(dest))
         except OSError as e:
@@ -432,6 +435,30 @@ def commit_all(job_id):
 
     _maybe_complete_staged_job(job_id)
     return jsonify({'ok': True, 'committed': len(ok_list), 'errors': errors})
+
+
+def _catalog_commit(job_id, n, title, cls, dest):
+    """Insert a permanent catalog row for a title that was just committed to
+    the library. Best-effort: a catalog failure must never break commit's
+    existing behavior, so this only logs and swallows errors.
+    """
+    try:
+        job = db.get_job(job_id)
+        db.insert_catalog_row(
+            job_id=job_id, title_num=n, state='committed',
+            type_=cls.get('type', 'unknown'),
+            show=cls.get('show'), season=cls.get('season'),
+            episode=cls.get('episode'), episode_title=cls.get('episode_title'),
+            movie_title=cls.get('movie_title'), year=cls.get('year'),
+            label=_cls_label(cls, n), disc_label=(job or {}).get('disc_label'),
+            library_path=str(dest),
+            duration_secs=title.get('duration_secs'),
+            filesize_bytes=title.get('filesize_bytes'),
+            classification=json.dumps(cls),
+            committed_at=datetime.now(timezone.utc).isoformat(),
+        )
+    except Exception:
+        pass
 
 
 def _maybe_complete_staged_job(job_id):

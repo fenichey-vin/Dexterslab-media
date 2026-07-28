@@ -246,6 +246,7 @@ code {
 .status-dot.queued    { background: var(--c-queued); }
 .status-dot.staged    { background: var(--c-staged); }
 .status-dot.complete  { background: var(--c-complete); }
+.status-dot.error     { background: var(--c-error); }
 
 @keyframes pulse {
   0%, 100% { opacity: 1; }

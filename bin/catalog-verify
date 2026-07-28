@@ -1,0 +1,23 @@
+#!/usr/bin/env python3
+"""
+catalog-verify — Phase 1 verification pass.
+
+Checks every catalog row in state 'pending' or 'committed' against the real
+library file: exists, non-empty, ffprobe-readable. Read-only — never
+deletes or modifies the file being checked, only updates the row's own
+state/fail_reason. Idempotent — re-running only revisits rows still sitting
+in pending/committed; already-verified or already-failed rows are untouched.
+"""
+
+import sys
+sys.path.insert(0, '/home/vinnie/mediaintel')
+
+import db
+import catalog
+
+if __name__ == '__main__':
+    db.init_db()
+    summary = catalog.verify_pending_rows()
+    print('Verification summary:')
+    for k, v in summary.items():
+        print(f'  {k}: {v}')

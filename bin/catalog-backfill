@@ -1,0 +1,25 @@
+#!/usr/bin/env python3
+"""
+catalog-backfill — Phase 1 discovery pass.
+
+Scans every job with status == 'complete' and inserts a 'pending' catalog
+row for each committed title that isn't already catalogued (matched on the
+recomputed library path, same routing logic commit itself uses). Read-only
+with respect to the filesystem — only SQLite rows are written, nothing is
+opened, moved, or deleted. Idempotent — safe to re-run.
+
+Run catalog-verify afterward to check those rows against the real files.
+"""
+
+import sys
+sys.path.insert(0, '/home/vinnie/mediaintel')
+
+import db
+import catalog
+
+if __name__ == '__main__':
+    db.init_db()
+    summary = catalog.backfill_from_completed_jobs()
+    print('Backfill summary:')
+    for k, v in summary.items():
+        print(f'  {k}: {v}')

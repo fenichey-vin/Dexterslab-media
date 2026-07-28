@@ -45,6 +45,36 @@ CREATE TABLE IF NOT EXISTS titles (
 );
 
 CREATE INDEX IF NOT EXISTS idx_titles_job ON titles(job_id);
+
+CREATE TABLE IF NOT EXISTS catalog (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id          TEXT NOT NULL,
+    title_num       INTEGER NOT NULL,
+    state           TEXT NOT NULL DEFAULT 'pending',
+    type            TEXT NOT NULL,
+    show            TEXT,
+    season          INTEGER,
+    episode         INTEGER,
+    episode_title   TEXT,
+    movie_title     TEXT,
+    year            INTEGER,
+    label           TEXT NOT NULL,
+    disc_label      TEXT,
+    library_path    TEXT NOT NULL,
+    duration_secs   REAL,
+    filesize_bytes  INTEGER,
+    classification  TEXT NOT NULL,
+    committed_at    TEXT NOT NULL,
+    verified_at     TEXT,
+    cleaned_at      TEXT,
+    fail_reason     TEXT,
+    UNIQUE(job_id, title_num),
+    UNIQUE(library_path)
+);
+
+CREATE INDEX IF NOT EXISTS idx_catalog_show  ON catalog(show);
+CREATE INDEX IF NOT EXISTS idx_catalog_movie ON catalog(movie_title);
+CREATE INDEX IF NOT EXISTS idx_catalog_state ON catalog(state);
 """
 
 
@@ -284,3 +314,70 @@ def get_classification_export(job_id):
         key = f"title_{t['title_num']}"
         out[key] = t['classification'] or {'type': 'unknown'}
     return out
+
+
+# ── Catalog ──────────────────────────────────────────────────────────────────
+# Permanent record of committed titles. Deliberately has no foreign key to
+# jobs/titles — it's meant to outlive those rows (and the review-dir files
+# they point at) once cleanup ever prunes them. See mediaintel-catalog-plan.md.
+
+def insert_catalog_row(job_id, title_num, state, type_, show, season, episode,
+                        episode_title, movie_title, year, label, disc_label,
+                        library_path, duration_secs, filesize_bytes,
+                        classification, committed_at):
+    """Insert one catalog row. Returns the new row id, or None if a row for
+    this (job_id, title_num) or this library_path already exists — callers
+    should treat None as 'already catalogued', not as an error."""
+    with _db() as conn:
+        try:
+            cur = conn.execute(
+                '''INSERT INTO catalog
+                   (job_id, title_num, state, type, show, season, episode,
+                    episode_title, movie_title, year, label, disc_label,
+                    library_path, duration_secs, filesize_bytes,
+                    classification, committed_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+                (job_id, title_num, state, type_, show, season, episode,
+                 episode_title, movie_title, year, label, disc_label,
+                 library_path, duration_secs, filesize_bytes,
+                 classification, committed_at)
+            )
+            return cur.lastrowid
+        except sqlite3.IntegrityError:
+            return None
+
+
+def get_catalog_row(job_id, title_num):
+    with _db() as conn:
+        row = conn.execute(
+            'SELECT * FROM catalog WHERE job_id=? AND title_num=?',
+            (job_id, title_num)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def get_catalog_rows_by_state(states):
+    """states: list of state strings, e.g. ['pending', 'committed']."""
+    placeholders = ','.join('?' for _ in states)
+    with _db() as conn:
+        rows = conn.execute(
+            f'SELECT * FROM catalog WHERE state IN ({placeholders})', states
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def update_catalog_state(catalog_id, state, verified_at=None, cleaned_at=None, fail_reason=None):
+    with _db() as conn:
+        conn.execute(
+            '''UPDATE catalog
+               SET state=?, verified_at=COALESCE(?, verified_at),
+                   cleaned_at=COALESCE(?, cleaned_at), fail_reason=?
+               WHERE id=?''',
+            (state, verified_at, cleaned_at, fail_reason, catalog_id)
+        )
+
+
+def get_all_catalog_rows():
+    with _db() as conn:
+        rows = conn.execute('SELECT * FROM catalog ORDER BY committed_at DESC').fetchall()
+        return [dict(r) for r in rows]
