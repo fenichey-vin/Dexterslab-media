@@ -25,6 +25,7 @@ from config import (REVIEW_DIR, DB_PATH, PORT, ANTHROPIC_API_KEY, ANTHROPIC_MODE
                     TV_DIR, MOVIES_DIR, SPECIALS_DIR, STAGING_DIR,
                     HB_PRESET, HB_FILTERS, HB_AUDIO)
 import db
+import catalog
 from disc import detect_drives, scan_disc, flag_titles, rip_title, get_duration, take_screenshots
 
 app = Flask(__name__, static_url_path='/media/static')
@@ -1391,6 +1392,50 @@ def screenshot(filepath):
     if not full.exists():
         return 'Not found', 404
     return send_from_directory(str(full.parent), full.name)
+
+
+# ── Catalog status (read-only window into the catalog table) ─────────────────
+
+@app.route('/media/catalog-status')
+def catalog_status():
+    counts      = db.get_catalog_state_counts()
+    all_rows    = db.get_all_catalog_rows()
+    failed_rows = [r for r in all_rows if r['state'] == 'failed']
+
+    # Recorded (at commit time) vs actual current size — read-only stat, no
+    # writes, no repair. A mismatch here is exactly what caught Man on Fire.
+    for r in failed_rows:
+        p = Path(r['library_path'])
+        try:
+            r['actual_size'] = p.stat().st_size if p.exists() else None
+        except OSError:
+            r['actual_size'] = None
+
+    conflict_data = catalog.find_uncataloged_conflicts()
+
+    return render_template('catalog_status.html',
+                           counts=counts,
+                           total_rows=len(all_rows),
+                           failed_rows=failed_rows,
+                           conflicts=conflict_data['conflicts'],
+                           unroutable=conflict_data['unroutable'])
+
+
+@app.route('/media/catalog/<int:catalog_id>/reverify', methods=['POST'])
+def catalog_reverify(catalog_id):
+    """Re-check one catalog row's file against disk. Read-only w.r.t. the
+    file (stat + ffprobe only) — never deletes, moves, or fixes anything,
+    never touches job status. Only this one row's state may change, and
+    only when its current state is 'failed' or 'verified' — see the guard
+    in catalog.reverify_row() itself.
+    """
+    try:
+        row = catalog.reverify_row(catalog_id)
+    except catalog.ReverifyNotAllowed as e:
+        return jsonify({'error': str(e)}), 409
+    if row is None:
+        return jsonify({'error': 'Catalog row not found'}), 404
+    return jsonify({'ok': True, 'state': row['state'], 'fail_reason': row['fail_reason']})
 
 
 # ── Healthcheck ───────────────────────────────────────────────────────────────

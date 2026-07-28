@@ -381,3 +381,16 @@ def get_all_catalog_rows():
     with _db() as conn:
         rows = conn.execute('SELECT * FROM catalog ORDER BY committed_at DESC').fetchall()
         return [dict(r) for r in rows]
+
+
+def get_catalog_row_by_id(catalog_id):
+    with _db() as conn:
+        row = conn.execute('SELECT * FROM catalog WHERE id=?', (catalog_id,)).fetchone()
+        return dict(row) if row else None
+
+
+def get_catalog_state_counts():
+    """Return {state: count} for every state present in the catalog table."""
+    with _db() as conn:
+        rows = conn.execute('SELECT state, COUNT(*) AS n FROM catalog GROUP BY state').fetchall()
+        return {r['state']: r['n'] for r in rows}

@@ -233,6 +233,13 @@ code {
 .badge.complete   { background: rgba(34,197,94,.15);  color: var(--c-complete); }
 .badge.error      { background: rgba(239,68,68,.15);  color: var(--c-error); }
 
+/* ─── Catalog states (distinct from job statuses above) ──────────────────────── */
+.badge.cat-pending    { background: rgba(124,111,163,.15); color: var(--c-queued); }
+.badge.cat-committed  { background: rgba(74,158,255,.15);  color: var(--c-review); }
+.badge.cat-verified   { background: rgba(34,197,94,.15);   color: var(--c-complete); }
+.badge.cat-cleaned    { background: rgba(249,115,22,.15);  color: var(--c-staged); }
+.badge.cat-failed     { background: rgba(239,68,68,.15);   color: var(--c-error); }
+
 .status-dot {
   display: inline-block;
   width: 8px; height: 8px;
@@ -619,6 +626,41 @@ code {
   color: var(--accent);
   margin-bottom: 6px;
 }
+
+/* ─── Catalog status page ────────────────────────────────────────────────────── */
+.stat-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: 12px;
+  margin-bottom: 28px;
+}
+.stat-tile {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 14px 16px;
+  text-align: center;
+}
+.stat-tile-num { font-size: 1.6rem; font-weight: 700; }
+.stat-tile-label {
+  font-size: 0.75rem;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-top: 4px;
+}
+.btn-reverify {
+  background: transparent;
+  color: var(--accent);
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  padding: 4px 10px;
+  font-size: 0.78rem;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.btn-reverify:hover { background: var(--accent); color: #fff; }
+.btn-reverify:disabled { opacity: 0.5; cursor: not-allowed; }
 
 /* ─── Rip page title table ───────────────────────────────────────────────────── */
 .rip-table {

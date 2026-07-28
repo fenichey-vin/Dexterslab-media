@@ -100,6 +100,23 @@ def backfill_from_completed_jobs():
     return summary
 
 
+def _check_file(library_path):
+    """Read-only check of one file: exists, non-empty, ffprobe-readable.
+    Returns (state, fail_reason) where fail_reason is None when verified.
+    Never opens the file for writing, never deletes, never moves anything.
+    """
+    path = Path(library_path)
+
+    if not path.exists():
+        return 'failed', 'missing'
+    if path.stat().st_size == 0:
+        return 'failed', 'zero_bytes'
+    duration = get_duration(path)
+    if not duration or duration <= 0:
+        return 'failed', 'unreadable'
+    return 'verified', None
+
+
 def verify_pending_rows():
     """Verification pass. For every catalog row in state 'pending' or
     'committed', check that library_path exists, is non-empty, and is
@@ -114,25 +131,118 @@ def verify_pending_rows():
 
     for row in db.get_catalog_rows_by_state(['pending', 'committed']):
         summary['checked'] += 1
-        path = Path(row['library_path'])
+        state, reason = _check_file(row['library_path'])
 
-        if not path.exists():
-            db.update_catalog_state(row['id'], 'failed', fail_reason='missing')
+        if state == 'verified':
+            db.update_catalog_state(row['id'], 'verified', verified_at=_now())
+            summary['verified'] += 1
+        elif reason == 'missing':
+            db.update_catalog_state(row['id'], 'failed', fail_reason=reason)
             summary['missing'] += 1
-            continue
-
-        if path.stat().st_size == 0:
-            db.update_catalog_state(row['id'], 'failed', fail_reason='zero_bytes')
+        else:
+            db.update_catalog_state(row['id'], 'failed', fail_reason=reason)
             summary['failed'] += 1
-            continue
-
-        duration = get_duration(path)
-        if not duration or duration <= 0:
-            db.update_catalog_state(row['id'], 'failed', fail_reason='unreadable')
-            summary['failed'] += 1
-            continue
-
-        db.update_catalog_state(row['id'], 'verified', verified_at=_now())
-        summary['verified'] += 1
 
     return summary
+
+
+class ReverifyNotAllowed(Exception):
+    """Raised by reverify_row() when the row's current state doesn't permit
+    reverification. The row is left completely unchanged when this is
+    raised — callers must handle it explicitly rather than the guard being
+    something a caller could silently skip past.
+    """
+
+
+def reverify_row(catalog_id):
+    """Re-check one specific catalog row's file — but only when its current
+    state is 'failed' or 'verified'. Rows in 'pending', 'committed', or
+    'cleaned' raise ReverifyNotAllowed instead, and are left completely
+    unchanged: 'pending'/'committed' belong to the backfill/verify pipeline
+    (not yet reconciled with disk at all), and 'cleaned' means the working
+    files this check would otherwise be confirming are already gone by
+    design, not by accident.
+
+    Permitted transitions: failed->verified, failed->failed,
+    verified->verified, verified->failed (e.g. a previously-good library
+    file that has since gone missing or corrupted).
+
+    Read-only with respect to the file itself (only stat + ffprobe); only
+    writes the state/fail_reason/verified_at of this one catalog row. Never
+    touches job status, never deletes or moves anything, never runs cleanup.
+
+    Returns the updated row dict, or None if catalog_id doesn't exist.
+    """
+    row = db.get_catalog_row_by_id(catalog_id)
+    if not row:
+        return None
+
+    if row['state'] not in ('failed', 'verified'):
+        raise ReverifyNotAllowed(
+            f"Catalog rows in state '{row['state']}' cannot be reverified"
+        )
+
+    state, reason = _check_file(row['library_path'])
+    if state == 'verified':
+        db.update_catalog_state(catalog_id, 'verified', verified_at=_now(), fail_reason=None)
+    else:
+        db.update_catalog_state(catalog_id, 'failed', fail_reason=reason)
+
+    return db.get_catalog_row_by_id(catalog_id)
+
+
+def find_uncataloged_conflicts():
+    """Read-only. For every committable title belonging to a 'complete' job
+    that has no catalog row yet, recompute its expected library path (same
+    routing logic commit uses) and check whether that exact path is already
+    claimed by a *different* (job_id, title_num) already in the catalog —
+    i.e. the UNIQUE(library_path) collisions backfill silently skipped
+    rather than guess about. Also reports titles whose classification
+    couldn't be routed to any path at all, as a separate bucket. Performs
+    no writes of any kind — pure recomputation and lookup.
+    """
+    # Lazy import — see the note in backfill_from_completed_jobs().
+    from app import _route_library, _cls_label
+
+    rows = db.get_all_catalog_rows()
+    by_path = {r['library_path']: (r['job_id'], r['title_num']) for r in rows}
+    cataloged_keys = {(r['job_id'], r['title_num']) for r in rows}
+
+    conflicts   = []
+    unroutable  = []
+
+    for job in db.get_all_jobs():
+        if job['status'] != 'complete':
+            continue
+        for t in db.get_titles(job['id']):
+            cls = t.get('classification')
+            if not cls:
+                continue
+            ctype = cls.get('type', 'unknown')
+            if ctype in ('play_all', 'deleted', 'unknown'):
+                continue
+
+            key = (job['id'], t['title_num'])
+            if key in cataloged_keys:
+                continue
+
+            label = _cls_label(cls, t['title_num'])
+            library_path = _route_library(cls, t['title_num'])
+            if library_path is None:
+                unroutable.append({
+                    'job_id': job['id'], 'title_num': t['title_num'], 'label': label,
+                })
+                continue
+
+            holder = by_path.get(str(library_path))
+            if holder:
+                conflicts.append({
+                    'job_id':          job['id'],
+                    'title_num':       t['title_num'],
+                    'label':           label,
+                    'library_path':    str(library_path),
+                    'holder_job_id':   holder[0],
+                    'holder_title_num': holder[1],
+                })
+
+    return {'conflicts': conflicts, 'unroutable': unroutable}

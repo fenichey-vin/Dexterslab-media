@@ -1,0 +1,153 @@
+{% extends "base.html" %}
+{% block title %}Catalog Status — Media Intel{% endblock %}
+
+{% block content %}
+<div class="page-header">
+  <div>
+    <a href="/media/" class="back-link">← Dashboard</a>
+    <h1>Catalog Status</h1>
+    <div class="header-meta">
+      {{ total_rows }} row{{ 's' if total_rows != 1 else '' }} total — read-only view, nothing here deletes, moves, or fixes anything
+    </div>
+  </div>
+</div>
+
+<div class="stat-grid">
+  {% for state in ['pending', 'committed', 'verified', 'cleaned', 'failed'] %}
+  <div class="stat-tile">
+    <div class="stat-tile-num">{{ counts.get(state, 0) }}</div>
+    <div class="stat-tile-label">{{ state }}</div>
+  </div>
+  {% endfor %}
+</div>
+
+<section class="job-section">
+  <h2 class="section-title">Failed catalog rows ({{ failed_rows|length }})</h2>
+  {% if failed_rows %}
+  <table class="rip-table">
+    <thead>
+      <tr>
+        <th>Job ID</th>
+        <th>Title</th>
+        <th>Label</th>
+        <th>Library path</th>
+        <th>Reason</th>
+        <th>Recorded size</th>
+        <th>Actual size</th>
+        <th></th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for r in failed_rows %}
+      <tr id="cat-row-{{ r.id }}">
+        <td><a href="/media/job/{{ r.job_id }}">{{ r.job_id }}</a></td>
+        <td>{{ r.title_num }}</td>
+        <td>{{ r.label }}</td>
+        <td style="font-family:'Courier New',monospace;font-size:0.8rem">{{ r.library_path }}</td>
+        <td><span class="badge cat-failed">{{ r.fail_reason or 'unknown' }}</span></td>
+        <td>{{ r.filesize_bytes | filesize }}</td>
+        <td>{{ r.actual_size | filesize }}</td>
+        <td>
+          <button class="btn-reverify" onclick="reverifyRow({{ r.id }}, this)">↺ Reverify</button>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p style="color:var(--muted);font-size:0.9rem">No failed rows.</p>
+  {% endif %}
+</section>
+
+<section class="job-section">
+  <h2 class="section-title">Uncataloged conflicts — UNIQUE(library_path) ({{ conflicts|length }})</h2>
+  <p style="color:var(--muted);font-size:0.85rem;margin-bottom:12px">
+    A completed job's title that maps to a library path already claimed by a different job/title in the catalog.
+    Backfill deliberately skips these rather than guess which one is real — see mediaintel-catalog-plan.md.
+  </p>
+  {% if conflicts %}
+  <table class="rip-table">
+    <thead>
+      <tr>
+        <th>Uncataloged job</th>
+        <th>Title</th>
+        <th>Label</th>
+        <th>Library path</th>
+        <th>Currently held by</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for c in conflicts %}
+      <tr>
+        <td><a href="/media/job/{{ c.job_id }}">{{ c.job_id }}</a></td>
+        <td>{{ c.title_num }}</td>
+        <td>{{ c.label }}</td>
+        <td style="font-family:'Courier New',monospace;font-size:0.8rem">{{ c.library_path }}</td>
+        <td><a href="/media/job/{{ c.holder_job_id }}">{{ c.holder_job_id }}</a> (title {{ c.holder_title_num }})</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p style="color:var(--muted);font-size:0.9rem">No path conflicts found.</p>
+  {% endif %}
+</section>
+
+{% if unroutable %}
+<section class="job-section">
+  <h2 class="section-title">Unroutable titles ({{ unroutable|length }})</h2>
+  <p style="color:var(--muted);font-size:0.85rem;margin-bottom:12px">
+    Completed titles whose classification couldn't be turned into a library path at all (separate from a path collision above).
+  </p>
+  <table class="rip-table">
+    <thead>
+      <tr>
+        <th>Job ID</th>
+        <th>Title</th>
+        <th>Label</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for u in unroutable %}
+      <tr>
+        <td><a href="/media/job/{{ u.job_id }}">{{ u.job_id }}</a></td>
+        <td>{{ u.title_num }}</td>
+        <td>{{ u.label }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endif %}
+{% endblock %}
+
+{% block extra_js %}
+<script>
+function reverifyRow(catalogId, btn) {
+  btn.disabled = true;
+  const original = btn.textContent;
+  btn.textContent = '…';
+  fetch(`/media/catalog/${catalogId}/reverify`, { method: 'POST' })
+    .then(r => r.json())
+    .then(d => {
+      if (d.error) {
+        alert('Error: ' + d.error);
+        btn.disabled = false;
+        btn.textContent = original;
+        return;
+      }
+      if (d.state === 'verified') {
+        alert('Now verified — reloading to update the tables.');
+      } else {
+        alert(`Still failing: ${d.fail_reason}`);
+      }
+      location.reload();
+    })
+    .catch(e => {
+      alert('Network error: ' + e);
+      btn.disabled = false;
+      btn.textContent = original;
+    });
+}
+</script>
+{% endblock %}
