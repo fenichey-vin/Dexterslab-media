@@ -9,11 +9,13 @@ implemented here. See mediaintel-catalog-plan.md.
 """
 
 import json
+import re
 from pathlib import Path
 from datetime import datetime, timezone
 
 import db
 from disc import get_duration
+from config import MOVIES_DIR, TV_DIR
 
 
 def _now():
@@ -246,3 +248,230 @@ def find_uncataloged_conflicts():
                 })
 
     return {'conflicts': conflicts, 'unroutable': unroutable}
+
+
+# ── Library import (Phase 2A) ────────────────────────────────────────────────
+# Catalogs media that already exists under MOVIES_DIR/TV_DIR but was never
+# committed through a mediaintel job (source='library_import'). Strictly
+# read-only with respect to the filesystem in BOTH dry_run and live modes —
+# only os.listdir/Path.stat-equivalent reads, never a write, move, rename, or
+# delete of any media file. dry_run additionally guarantees zero database
+# writes (already-present is checked via db.get_catalog_row_by_path, a plain
+# SELECT). Rows are always inserted as state='pending' — never auto-verified;
+# bin/catalog-verify (unchanged) is what promotes them.
+
+VIDEO_EXTS = {'.mkv', '.mp4', '.avi', '.m4v', '.mov', '.wmv'}
+_MOVIE_RE  = re.compile(r'^(.+) \((\d{4})\)$')
+_SEASON_RE = re.compile(r'^Season\s+(\d+)$', re.IGNORECASE)
+
+
+def import_library_content(dry_run=True):
+    """Scan MOVIES_DIR and TV_DIR for pre-existing library content with no
+    catalog row yet. Returns a summary dict with one list per bucket
+    (would_insert, already_present, ambiguous, unparsed, errors,
+    known_skips) plus an 'inserted' count. Safe to re-run: already-catalogued
+    paths (any source) are reported, never re-inserted or modified.
+    """
+    result = {
+        'would_insert': [], 'already_present': [], 'ambiguous': [],
+        'unparsed': [], 'errors': [], 'known_skips': [], 'inserted': 0,
+    }
+
+    _scan_movies(result)
+    _scan_tv(result)
+
+    if not dry_run:
+        now = _now()
+        for item in list(result['would_insert']):
+            cls = item['classification']
+            row_id = db.insert_catalog_row(
+                job_id=None, title_num=0, state='pending',
+                type_=cls['type'], show=cls.get('show'), season=cls.get('season'),
+                episode=cls.get('episode'), episode_title=cls.get('episode_title'),
+                movie_title=cls.get('movie_title'), year=cls.get('year'),
+                label=item['label'], disc_label=None,
+                library_path=item['library_path'], duration_secs=None,
+                filesize_bytes=item['filesize_bytes'],
+                classification=json.dumps(cls), committed_at=now,
+                source='library_import',
+            )
+            if row_id is None:
+                # Collided with a row that appeared since the scan (e.g. a
+                # concurrent commit claimed this path) -- report it as
+                # already-present rather than silently dropping it.
+                result['would_insert'].remove(item)
+                result['already_present'].append(item)
+            else:
+                result['inserted'] += 1
+
+    return result
+
+
+def _record_candidate(result, path, cls):
+    library_path = str(path)
+    try:
+        filesize_bytes = path.stat().st_size
+    except OSError as e:
+        result['errors'].append({'path': library_path, 'reason': str(e)})
+        return
+
+    from app import _cls_label
+    item = {
+        'library_path': library_path,
+        'label': _cls_label(cls, 0),
+        'classification': cls,
+        'filesize_bytes': filesize_bytes,
+    }
+    existing = db.get_catalog_row_by_path(library_path)
+    if existing:
+        item['existing_state']  = existing['state']
+        item['existing_source'] = existing['source']
+        result['already_present'].append(item)
+    else:
+        result['would_insert'].append(item)
+
+
+def _scan_movies(result):
+    if not MOVIES_DIR.is_dir():
+        result['errors'].append({'path': str(MOVIES_DIR), 'reason': 'movies root not found'})
+        return
+    try:
+        entries = sorted(MOVIES_DIR.iterdir())
+    except OSError as e:
+        result['errors'].append({'path': str(MOVIES_DIR), 'reason': str(e)})
+        return
+
+    for entry in entries:
+        try:
+            if entry.is_file():
+                result['unparsed'].append({
+                    'path': str(entry),
+                    'reason': 'stray file directly in movies root, not inside a title folder',
+                })
+            elif entry.is_dir():
+                _classify_movie_folder(entry, result)
+        except OSError as e:
+            result['errors'].append({'path': str(entry), 'reason': str(e)})
+
+
+def _classify_movie_folder(folder, result):
+    try:
+        files = sorted(f for f in folder.iterdir() if f.is_file())
+    except OSError as e:
+        result['errors'].append({'path': str(folder), 'reason': str(e)})
+        return
+
+    if not files:
+        result['known_skips'].append({'path': str(folder), 'reason': 'empty directory'})
+        return
+
+    videos = [f for f in files if f.suffix.lower() in VIDEO_EXTS]
+    if len(videos) > 1:
+        result['ambiguous'].append({
+            'path': str(folder),
+            'reason': f'{len(videos)} video files in one folder',
+            'candidates': [str(v) for v in videos],
+        })
+        return
+    if not videos:
+        result['unparsed'].append({'path': str(folder), 'reason': 'no recognized video file in folder'})
+        return
+
+    video = videos[0]
+    m = _MOVIE_RE.match(folder.name)
+    if not m:
+        result['unparsed'].append({'path': str(folder), 'reason': "folder name doesn't match 'Title (Year)'"})
+        return
+    if video.stem != folder.name:
+        result['unparsed'].append({
+            'path': str(folder),
+            'reason': f"video filename '{video.name}' doesn't match folder name",
+        })
+        return
+
+    title, year = m.group(1), int(m.group(2))
+    _record_candidate(result, video, {'type': 'movie', 'movie_title': title, 'year': year})
+
+
+def _scan_tv(result):
+    if not TV_DIR.is_dir():
+        result['errors'].append({'path': str(TV_DIR), 'reason': 'tv root not found'})
+        return
+    try:
+        show_entries = sorted(TV_DIR.iterdir())
+    except OSError as e:
+        result['errors'].append({'path': str(TV_DIR), 'reason': str(e)})
+        return
+
+    for show_dir in show_entries:
+        try:
+            if show_dir.is_file():
+                result['unparsed'].append({
+                    'path': str(show_dir),
+                    'reason': 'stray file directly in tv root, not inside a show folder',
+                })
+            elif show_dir.is_dir():
+                _scan_show(show_dir, result)
+        except OSError as e:
+            result['errors'].append({'path': str(show_dir), 'reason': str(e)})
+
+
+def _scan_show(show_dir, result):
+    show = show_dir.name
+    try:
+        entries = sorted(show_dir.iterdir())
+    except OSError as e:
+        result['errors'].append({'path': str(show_dir), 'reason': str(e)})
+        return
+
+    if not entries:
+        result['known_skips'].append({'path': str(show_dir), 'reason': 'empty show directory'})
+        return
+
+    for entry in entries:
+        if entry.is_file():
+            result['unparsed'].append({
+                'path': str(entry),
+                'reason': f"stray file directly in '{show}' folder, not inside a Season folder",
+            })
+            continue
+        if not entry.is_dir():
+            continue
+        m = _SEASON_RE.match(entry.name)
+        if not m:
+            result['unparsed'].append({'path': str(entry), 'reason': "folder name doesn't match 'Season NN'"})
+            continue
+        _scan_season(show, int(m.group(1)), entry, result)
+
+
+def _scan_season(show, season, season_dir, result):
+    try:
+        files = sorted(f for f in season_dir.iterdir() if f.is_file())
+    except OSError as e:
+        result['errors'].append({'path': str(season_dir), 'reason': str(e)})
+        return
+
+    if not files:
+        result['known_skips'].append({'path': str(season_dir), 'reason': 'empty season folder'})
+        return
+
+    ep_re = re.compile(rf'^{re.escape(show)} - S(\d+)E(\d+)\.mkv$')
+    for f in files:
+        if f.suffix.lower() != '.mkv':
+            result['unparsed'].append({'path': str(f), 'reason': 'not a .mkv file'})
+            continue
+        m = ep_re.match(f.name)
+        if not m:
+            result['unparsed'].append({
+                'path': str(f),
+                'reason': f"filename doesn't match '{show} - S##E##.mkv'",
+            })
+            continue
+        ep_season, episode = int(m.group(1)), int(m.group(2))
+        if ep_season != season:
+            result['unparsed'].append({
+                'path': str(f),
+                'reason': f'season in filename (S{ep_season:02d}) does not match folder (Season {season:02d})',
+            })
+            continue
+        _record_candidate(result, f, {'type': 'tv_episode', 'show': show, 'season': season, 'episode': episode})

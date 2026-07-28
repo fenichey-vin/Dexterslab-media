@@ -1398,7 +1398,8 @@ def screenshot(filepath):
 
 @app.route('/media/catalog-status')
 def catalog_status():
-    counts      = db.get_catalog_state_counts()
+    counts        = db.get_catalog_state_counts()
+    source_counts = db.get_catalog_source_counts()
     all_rows    = db.get_all_catalog_rows()
     failed_rows = [r for r in all_rows if r['state'] == 'failed']
 
@@ -1415,6 +1416,7 @@ def catalog_status():
 
     return render_template('catalog_status.html',
                            counts=counts,
+                           source_counts=source_counts,
                            total_rows=len(all_rows),
                            failed_rows=failed_rows,
                            conflicts=conflict_data['conflicts'],

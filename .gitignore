@@ -1,4 +1,6 @@
 mediaintel.db
+mediaintel.db.bak-*
+*.db.bak
 __pycache__/
 *.pyc
 *.pyo

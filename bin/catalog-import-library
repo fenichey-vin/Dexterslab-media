@@ -1,0 +1,81 @@
+#!/usr/bin/env python3
+"""
+catalog-import-library — Phase 2A library import.
+
+Scans MOVIES_DIR (/srv/media/movies) and TV_DIR (/srv/media/tv) for media
+that already exists in the library but was never committed through a
+mediaintel job, and catalogs it with source='library_import' in state
+'pending'. Read-only with respect to the filesystem in every mode -- never
+renames, moves, or deletes a file. Defaults to --dry-run: reports what it
+would do without touching the database at all. Pass --live to actually
+insert rows. Safely rerunnable either way -- already-catalogued paths
+(any source) are reported, never re-inserted or modified.
+
+Run bin/catalog-verify afterward to promote the new pending rows to
+verified/failed, exactly like Phase 1's backfilled rows.
+"""
+
+import argparse
+import sys
+
+sys.path.insert(0, '/home/vinnie/mediaintel')
+
+import db
+import catalog
+
+
+def _print_bucket(title, items, limit=20):
+    print(f'\n{title} ({len(items)})')
+    for item in items[:limit]:
+        path = item.get('path') or item.get('library_path', '')
+        reason = item.get('reason')
+        label = item.get('label')
+        if reason:
+            print(f'  {path}  -- {reason}')
+        elif label:
+            print(f'  {path}  -- {label}')
+        else:
+            print(f'  {path}')
+    if len(items) > limit:
+        print(f'  ... and {len(items) - limit} more')
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description=__doc__)
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument('--dry-run', action='store_true', default=True,
+                       help='Report only, no database writes (default).')
+    mode.add_argument('--live', action='store_true',
+                       help='Actually insert pending catalog rows.')
+    parser.add_argument('--limit', type=int, default=20,
+                         help='Max items to print per bucket (default 20; counts are always exact).')
+    args = parser.parse_args()
+
+    dry_run = not args.live
+
+    db.init_db()
+
+    print('=' * 70)
+    print('DRY RUN -- zero database writes, zero filesystem changes' if dry_run
+          else 'LIVE RUN -- inserting pending catalog rows')
+    print('=' * 70)
+
+    summary = catalog.import_library_content(dry_run=dry_run)
+
+    print('\nCounts:')
+    for key in ('would_insert', 'already_present', 'ambiguous', 'unparsed', 'errors', 'known_skips'):
+        print(f'  {key}: {len(summary[key])}')
+    if not dry_run:
+        print(f'  inserted: {summary["inserted"]}')
+
+    _print_bucket('Would insert' if dry_run else 'Inserted', summary['would_insert'], args.limit)
+    _print_bucket('Ambiguous (needs human review)', summary['ambiguous'], args.limit)
+    _print_bucket('Unparsed (naming does not match expected layout)', summary['unparsed'], args.limit)
+    _print_bucket('Errors', summary['errors'], args.limit)
+    _print_bucket('Known skips (empty directories)', summary['known_skips'], args.limit)
+
+    if dry_run:
+        print('\nThis was a dry run. Re-run with --live to actually insert rows.')
+    else:
+        print(f'\nInserted {summary["inserted"]} new library_import rows in state=pending.')
+        print('Run bin/catalog-verify next to promote them to verified/failed.')

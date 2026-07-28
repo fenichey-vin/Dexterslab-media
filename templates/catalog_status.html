@@ -21,6 +21,16 @@
   {% endfor %}
 </div>
 
+<h2 class="section-title" style="margin-top:24px">Source breakdown</h2>
+<div class="stat-grid">
+  {% for source, n in source_counts.items() %}
+  <div class="stat-tile">
+    <div class="stat-tile-num">{{ n }}</div>
+    <div class="stat-tile-label">{{ source }}</div>
+  </div>
+  {% endfor %}
+</div>
+
 <section class="job-section">
   <h2 class="section-title">Failed catalog rows ({{ failed_rows|length }})</h2>
   {% if failed_rows %}
@@ -40,7 +50,7 @@
     <tbody>
       {% for r in failed_rows %}
       <tr id="cat-row-{{ r.id }}">
-        <td><a href="/media/job/{{ r.job_id }}">{{ r.job_id }}</a></td>
+        <td>{% if r.job_id %}<a href="/media/job/{{ r.job_id }}">{{ r.job_id }}</a>{% else %}<span style="color:var(--muted)">library import</span>{% endif %}</td>
         <td>{{ r.title_num }}</td>
         <td>{{ r.label }}</td>
         <td style="font-family:'Courier New',monospace;font-size:0.8rem">{{ r.library_path }}</td>
@@ -79,11 +89,11 @@
     <tbody>
       {% for c in conflicts %}
       <tr>
-        <td><a href="/media/job/{{ c.job_id }}">{{ c.job_id }}</a></td>
+        <td>{% if c.job_id %}<a href="/media/job/{{ c.job_id }}">{{ c.job_id }}</a>{% else %}<span style="color:var(--muted)">library import</span>{% endif %}</td>
         <td>{{ c.title_num }}</td>
         <td>{{ c.label }}</td>
         <td style="font-family:'Courier New',monospace;font-size:0.8rem">{{ c.library_path }}</td>
-        <td><a href="/media/job/{{ c.holder_job_id }}">{{ c.holder_job_id }}</a> (title {{ c.holder_title_num }})</td>
+        <td>{% if c.holder_job_id %}<a href="/media/job/{{ c.holder_job_id }}">{{ c.holder_job_id }}</a> (title {{ c.holder_title_num }}){% else %}<span style="color:var(--muted)">library import</span>{% endif %}</td>
       </tr>
       {% endfor %}
     </tbody>

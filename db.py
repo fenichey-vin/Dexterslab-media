@@ -48,7 +48,7 @@ CREATE INDEX IF NOT EXISTS idx_titles_job ON titles(job_id);
 
 CREATE TABLE IF NOT EXISTS catalog (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    job_id          TEXT NOT NULL,
+    job_id          TEXT,
     title_num       INTEGER NOT NULL,
     state           TEXT NOT NULL DEFAULT 'pending',
     type            TEXT NOT NULL,
@@ -68,6 +68,7 @@ CREATE TABLE IF NOT EXISTS catalog (
     verified_at     TEXT,
     cleaned_at      TEXT,
     fail_reason     TEXT,
+    source          TEXT NOT NULL DEFAULT 'mediaintel_job',
     UNIQUE(job_id, title_num),
     UNIQUE(library_path)
 );
@@ -99,6 +100,66 @@ def _db():
         conn.close()
 
 
+def _migrate_catalog_job_id_nullable(conn):
+    """One-time table rebuild: relax catalog.job_id from NOT NULL to nullable,
+    so library_import rows (which have no owning job) can be stored. SQLite
+    has no ALTER COLUMN, so this is the standard rebuild-and-swap. Guarded on
+    the live column's own notnull flag, so calling init_db() again (or on a
+    fresh install where SCHEMA already created job_id nullable) is a no-op.
+    """
+    cols = conn.execute("PRAGMA table_info(catalog)").fetchall()
+    job_id_col = next((c for c in cols if c[1] == 'job_id'), None)
+    if job_id_col is None or job_id_col[3] == 0:
+        return  # column missing (shouldn't happen) or already nullable
+
+    conn.executescript("""
+        CREATE TABLE catalog_new (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id          TEXT,
+            title_num       INTEGER NOT NULL,
+            state           TEXT NOT NULL DEFAULT 'pending',
+            type            TEXT NOT NULL,
+            show            TEXT,
+            season          INTEGER,
+            episode         INTEGER,
+            episode_title   TEXT,
+            movie_title     TEXT,
+            year            INTEGER,
+            label           TEXT NOT NULL,
+            disc_label      TEXT,
+            library_path    TEXT NOT NULL,
+            duration_secs   REAL,
+            filesize_bytes  INTEGER,
+            classification  TEXT NOT NULL,
+            committed_at    TEXT NOT NULL,
+            verified_at     TEXT,
+            cleaned_at      TEXT,
+            fail_reason     TEXT,
+            source          TEXT NOT NULL DEFAULT 'mediaintel_job',
+            UNIQUE(job_id, title_num),
+            UNIQUE(library_path)
+        );
+        INSERT INTO catalog_new
+            (id, job_id, title_num, state, type, show, season, episode,
+             episode_title, movie_title, year, label, disc_label, library_path,
+             duration_secs, filesize_bytes, classification, committed_at,
+             verified_at, cleaned_at, fail_reason, source)
+        SELECT
+            id, job_id, title_num, state, type, show, season, episode,
+            episode_title, movie_title, year, label, disc_label, library_path,
+            duration_secs, filesize_bytes, classification, committed_at,
+            verified_at, cleaned_at, fail_reason, COALESCE(source, 'mediaintel_job')
+        FROM catalog;
+        DROP TABLE catalog;
+        ALTER TABLE catalog_new RENAME TO catalog;
+        CREATE INDEX IF NOT EXISTS idx_catalog_show  ON catalog(show);
+        CREATE INDEX IF NOT EXISTS idx_catalog_movie ON catalog(movie_title);
+        CREATE INDEX IF NOT EXISTS idx_catalog_state ON catalog(state);
+        UPDATE sqlite_sequence SET seq = (SELECT COALESCE(MAX(id), 0) FROM catalog)
+            WHERE name = 'catalog';
+    """)
+
+
 def init_db():
     with _db() as conn:
         conn.executescript(SCHEMA)
@@ -122,6 +183,11 @@ def init_db():
             conn.execute('ALTER TABLE jobs ADD COLUMN encode_progress TEXT')
         except Exception:
             pass
+        try:
+            conn.execute("ALTER TABLE catalog ADD COLUMN source TEXT NOT NULL DEFAULT 'mediaintel_job'")
+        except Exception:
+            pass
+        _migrate_catalog_job_id_nullable(conn)
 
 
 def _now():
@@ -324,10 +390,15 @@ def get_classification_export(job_id):
 def insert_catalog_row(job_id, title_num, state, type_, show, season, episode,
                         episode_title, movie_title, year, label, disc_label,
                         library_path, duration_secs, filesize_bytes,
-                        classification, committed_at):
+                        classification, committed_at, source='mediaintel_job'):
     """Insert one catalog row. Returns the new row id, or None if a row for
     this (job_id, title_num) or this library_path already exists — callers
-    should treat None as 'already catalogued', not as an error."""
+    should treat None as 'already catalogued', not as an error.
+
+    source defaults to 'mediaintel_job' so every existing caller (Phase 1
+    backfill, app.py's _catalog_commit) is unaffected; the library importer
+    is the only caller that passes source='library_import'.
+    """
     with _db() as conn:
         try:
             cur = conn.execute(
@@ -335,12 +406,12 @@ def insert_catalog_row(job_id, title_num, state, type_, show, season, episode,
                    (job_id, title_num, state, type, show, season, episode,
                     episode_title, movie_title, year, label, disc_label,
                     library_path, duration_secs, filesize_bytes,
-                    classification, committed_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+                    classification, committed_at, source)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
                 (job_id, title_num, state, type_, show, season, episode,
                  episode_title, movie_title, year, label, disc_label,
                  library_path, duration_secs, filesize_bytes,
-                 classification, committed_at)
+                 classification, committed_at, source)
             )
             return cur.lastrowid
         except sqlite3.IntegrityError:
@@ -387,6 +458,25 @@ def get_catalog_row_by_id(catalog_id):
     with _db() as conn:
         row = conn.execute('SELECT * FROM catalog WHERE id=?', (catalog_id,)).fetchone()
         return dict(row) if row else None
+
+
+def get_catalog_row_by_path(library_path):
+    """Look up a catalog row by its library_path (UNIQUE), regardless of
+    source or state. Used by the library importer to decide already-present
+    vs would-insert without inserting-and-catching — so dry-run mode can
+    answer this without writing anything."""
+    with _db() as conn:
+        row = conn.execute(
+            'SELECT * FROM catalog WHERE library_path=?', (str(library_path),)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def get_catalog_source_counts():
+    """Return {source: count} for every source present in the catalog table."""
+    with _db() as conn:
+        rows = conn.execute('SELECT source, COUNT(*) AS n FROM catalog GROUP BY source').fetchall()
+        return {r['source']: r['n'] for r in rows}
 
 
 def get_catalog_state_counts():
