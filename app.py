@@ -171,6 +171,19 @@ def fmt_eta(secs):
     return f'{m}m'
 
 
+def _iso_diff_secs(start_iso, end_iso):
+    """Seconds between two ISO timestamps, or None if either is missing/
+    unparseable. Never fabricates a value -- Phase 3 provenance helper."""
+    if not start_iso or not end_iso:
+        return None
+    try:
+        start = datetime.fromisoformat(start_iso)
+        end   = datetime.fromisoformat(end_iso)
+        return max(0, int((end - start).total_seconds()))
+    except Exception:
+        return None
+
+
 @app.template_filter('reltime')
 def fmt_reltime(iso):
     try:
@@ -225,8 +238,77 @@ def job_detail(job_id):
         if cls:
             t['duplicates'] = catalog.find_possible_duplicates(
                 cls, exclude_job_id=job_id, exclude_title_num=t['title_num'])
+    # Per-title provenance milestones (Phase 3) -- derived entirely from
+    # existing titles/catalog data, nothing new stored per title.
+    for t in titles:
+        cls = t.get('classification')
+        cat_row = db.get_catalog_row(job_id, t['title_num'])
+        t['catalog_row'] = cat_row
+        t['is_skip_type'] = bool(cls) and cls.get('type') in ('play_all', 'deleted', 'unknown')
+        t['m_classified'] = cls is not None
+        t['m_committed']  = cat_row is not None
+        t['m_verified']   = cat_row is not None and cat_row['state'] == 'verified'
+        t['m_failed']     = cat_row is not None and cat_row['state'] == 'failed'
+        t['m_encoded']    = cat_row is not None or bool(t.get('staged_path'))
+
+    summary = _build_job_summary(job, titles)
+
     return render_template('job.html', job=job, titles=titles,
-                           classified_count=classified, total_count=len(titles))
+                           classified_count=classified, total_count=len(titles),
+                           summary=summary)
+
+
+def _build_job_summary(job, titles):
+    """Job Summary + Timeline data (Phase 3) -- read-only, computed fresh on
+    every load from existing jobs/titles/catalog fields plus the 3 new
+    provenance timestamps. Never writes anything, never fabricates a
+    timestamp that isn't actually stored.
+    """
+    committed = [t for t in titles if t['catalog_row']]
+    failed    = [t for t in titles if t['catalog_row'] and t['catalog_row']['state'] == 'failed']
+    skipped   = [t for t in titles if t['is_skip_type']]
+    not_committed = [
+        t for t in titles
+        if t['classification'] and not t['is_skip_type'] and not t['catalog_row']
+    ]
+    dup_flagged = [t for t in titles if t.get('duplicates')]
+
+    all_committed_verified = bool(committed) and all(
+        t['catalog_row']['state'] == 'verified' for t in committed)
+
+    rip_secs      = _iso_diff_secs(job.get('created_at'), job.get('rip_completed_at'))
+    encode_secs   = _iso_diff_secs(job.get('encode_started_at'), job.get('encode_completed_at'))
+    # Job Lifetime: overall elapsed wall-clock span from job creation to the
+    # last recorded activity -- NOT a processing duration. For older/idle
+    # jobs this includes time spent waiting in review/staging, not just
+    # active work; that's why it's named "lifetime," not "processing time."
+    lifetime_secs = _iso_diff_secs(job.get('created_at'), job.get('updated_at')) if job['status'] == 'complete' else None
+
+    latest_classified_at = max(
+        (t['classified_at'] for t in titles if t.get('classified_at')), default=None)
+    latest_verified_at = max(
+        (t['catalog_row']['verified_at'] for t in titles
+         if t['catalog_row'] and t['catalog_row'].get('verified_at')), default=None)
+    latest_committed_at = max(
+        (t['catalog_row']['committed_at'] for t in titles if t['catalog_row']), default=None)
+
+    final_files = [
+        {'label': t['catalog_row']['label'], 'library_path': t['catalog_row']['library_path'],
+         'catalog_id': t['catalog_row']['id']}
+        for t in committed
+    ]
+
+    return {
+        'processed': len(titles), 'committed': len(committed), 'failed': len(failed),
+        'skipped': len(skipped), 'not_committed': len(not_committed),
+        'dup_flagged_count': len(dup_flagged),
+        'all_committed_verified': all_committed_verified,
+        'rip_secs': rip_secs, 'encode_secs': encode_secs, 'lifetime_secs': lifetime_secs,
+        'latest_classified_at': latest_classified_at,
+        'latest_verified_at': latest_verified_at,
+        'latest_committed_at': latest_committed_at,
+        'final_files': final_files,
+    }
 
 
 # ── Classification ────────────────────────────────────────────────────────────
@@ -739,6 +821,7 @@ def _encode_job_bg(job_id):
         return
 
     db.set_job_status(job_id, 'encoding')
+    db.set_job_timestamp(job_id, 'encode_started_at')
 
     job_dir  = Path(job['review_path'])
     cls_file = job_dir / 'classification.json'
@@ -814,6 +897,7 @@ def _encode_job_bg(job_id):
             _log(f'FAIL {job_id} title_{title_num}: HandBrakeCLI error (rc={rc})')
 
     db.set_encode_progress(job_id, None)
+    db.set_job_timestamp(job_id, 'encode_completed_at')
 
     if fail == 0:
         db.set_job_status(job_id, 'staged')
@@ -1127,6 +1211,7 @@ def _rip_disc_bg(job_id, device, title_nums, disc_context):
             subprocess.run(['eject', device], capture_output=True)
         except Exception:
             pass
+        db.set_job_timestamp(job_id, 'rip_completed_at')
         db.set_job_status(job_id, 'review')
 
         # ── Phase 2: screenshots + classification (drive no longer needed) ────

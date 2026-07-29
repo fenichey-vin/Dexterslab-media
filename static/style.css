@@ -660,6 +660,15 @@ code {
 .dup-conf-medium { background: rgba(74,158,255,.25); color: var(--accent); }
 .dup-conf-low    { background: transparent; border: 1px solid var(--border); color: var(--muted); }
 
+/* ─── Job Summary (Phase 3, permanent provenance) ────────────────────────────── */
+.prov-summary {
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 14px 16px;
+}
+.prov-summary .dup-meta { margin: 4px 0; }
+
 /* ─── Disc ID card ───────────────────────────────────────────────────────────── */
 .disc-id-card {
   background: rgba(74,158,255,.05);

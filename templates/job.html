@@ -61,6 +61,82 @@
 <div class="notice staged">Encoded files are in <code>/srv/media/staging/</code> — watch them in Jellyfin, fix any classifications below, then click <strong>Move to Library</strong> on each title or <strong>Commit All</strong> to file them all at once.</div>
 {% endif %}
 
+<!-- Job Summary (Phase 3, permanent provenance record) -->
+<section class="job-section">
+  <h2 class="section-title">Job Summary</h2>
+  <div class="prov-summary">
+    <div class="dup-meta">
+      Disc: {{ job.disc_label or '—' }} &nbsp;·&nbsp; Drive: {{ job.drive or '—' }}
+    </div>
+    <div class="dup-meta">
+      Titles: {{ summary.processed }} processed
+      &nbsp;·&nbsp; {{ summary.committed }} committed
+      &nbsp;·&nbsp; {{ summary.failed }} failed
+      &nbsp;·&nbsp; {{ summary.skipped }} skipped
+      {% if summary.not_committed %}&nbsp;·&nbsp; {{ summary.not_committed }} not committed{% endif %}
+    </div>
+    <div class="dup-meta">
+      Rip Time: {{ summary.rip_secs | duration if summary.rip_secs is not none else 'not recorded' }}
+      &nbsp;·&nbsp; Encode Time: {{ summary.encode_secs | duration if summary.encode_secs is not none else 'not recorded' }}
+      &nbsp;·&nbsp; Job Lifetime: {{ summary.lifetime_secs | duration if summary.lifetime_secs is not none else 'not recorded' }}
+      {% if summary.lifetime_secs is not none %}(disc → last activity){% endif %}
+    </div>
+    <div class="dup-meta">
+      Verification:
+      {% if summary.committed == 0 %}no titles committed yet
+      {% elif summary.all_committed_verified %}✓ all committed titles verified
+      {% else %}⚠ not all committed titles are verified — see Failed catalog rows on Catalog Status
+      {% endif %}
+    </div>
+    <div class="dup-meta">
+      Duplicates: possible duplicate flagged for {{ summary.dup_flagged_count }} title{{ 's' if summary.dup_flagged_count != 1 else '' }}
+    </div>
+
+    {% if summary.final_files %}
+    <div class="dup-meta" style="margin-top:8px"><strong>Final files:</strong></div>
+    <ul class="dup-reasons">
+      {% for f in summary.final_files %}
+      <li>
+        {{ f.label }} &nbsp;→&nbsp;
+        <span style="font-family:'Courier New',monospace;font-size:0.78rem">{{ f.library_path }}</span>
+        &nbsp;·&nbsp; Catalog row #{{ f.catalog_id }}
+        <a class="btn btn-ghost" style="padding:1px 8px;font-size:0.75rem" href="/media/catalog/{{ f.catalog_id }}">Open Catalog Entry</a>
+      </li>
+      {% endfor %}
+    </ul>
+    {% endif %}
+  </div>
+</section>
+
+<!-- Job Timeline (Phase 3) -->
+<section class="job-section">
+  <h2 class="section-title">Job Timeline</h2>
+  <table class="rip-table">
+    <tbody>
+      <tr><th>Disc inserted</th><td>{{ job.created_at[:19] | replace('T',' ') }}</td></tr>
+      <tr><th>Rip started</th><td>{{ job.created_at[:19] | replace('T',' ') }} <span class="dup-meta" style="display:inline">(same moment)</span></td></tr>
+      <tr><th>Rip completed</th>
+          <td>{% if job.rip_completed_at %}{{ job.rip_completed_at[:19] | replace('T',' ') }}{% if summary.rip_secs is not none %} — {{ summary.rip_secs | duration }}{% endif %}{% else %}<span style="color:var(--muted)">not recorded</span>{% endif %}</td></tr>
+      <tr><th>Classification saved</th>
+          <td>{% if summary.latest_classified_at %}{{ summary.latest_classified_at[:19] | replace('T',' ') }} (latest of {{ classified_count }} title{{ 's' if classified_count != 1 else '' }}){% else %}<span style="color:var(--muted)">not yet classified</span>{% endif %}</td></tr>
+      <tr><th>Duplicate check</th>
+          <td><span style="color:var(--muted)">current:</span> {{ summary.dup_flagged_count }} possible duplicate{{ 's' if summary.dup_flagged_count != 1 else '' }} flagged</td></tr>
+      <tr><th>Encode started</th>
+          <td>{% if job.encode_started_at %}{{ job.encode_started_at[:19] | replace('T',' ') }}{% else %}<span style="color:var(--muted)">not recorded</span>{% endif %}</td></tr>
+      <tr><th>Encode completed</th>
+          <td>{% if job.encode_completed_at %}{{ job.encode_completed_at[:19] | replace('T',' ') }}{% if summary.encode_secs is not none %} — {{ summary.encode_secs | duration }}{% endif %}{% else %}<span style="color:var(--muted)">not recorded</span>{% endif %}</td></tr>
+      <tr><th>Verification completed</th>
+          <td>{% if summary.latest_verified_at %}{{ summary.latest_verified_at[:19] | replace('T',' ') }}{% else %}<span style="color:var(--muted)">not yet verified</span>{% endif %}</td></tr>
+      <tr><th>Committed to library</th>
+          <td>{% if summary.latest_committed_at %}{{ summary.latest_committed_at[:19] | replace('T',' ') }}{% else %}<span style="color:var(--muted)">not yet committed</span>{% endif %}</td></tr>
+      <tr><th>Catalog row created</th>
+          <td>{% if summary.final_files %}{{ summary.final_files | length }} row{{ 's' if summary.final_files | length != 1 else '' }} <span class="dup-meta" style="display:inline">(same instant as commit)</span>{% else %}<span style="color:var(--muted)">none yet</span>{% endif %}</td></tr>
+      <tr><th>Library path</th>
+          <td>{% if summary.final_files %}see Final files above{% else %}<span style="color:var(--muted)">none yet</span>{% endif %}</td></tr>
+    </tbody>
+  </table>
+</section>
+
 {% if job.status == 'review' %}
 <!-- Disc Context Panel -->
 <div style="background:var(--surface2);border:1px solid var(--border);border-radius:8px;
@@ -244,6 +320,22 @@
         <div class="cls-badge cls-unknown">Unclassified</div>
       {% endif %}
     </div>
+
+    <!-- Per-title provenance milestones (Phase 3) -->
+    {% if t.classification and not t.is_skip_type %}
+    <div class="dup-meta" style="margin:0 0 8px">
+      Classified {{ '✓' if t.m_classified else '—' }}
+      &nbsp;·&nbsp; Encoded {{ '✓' if t.m_encoded else '—' }}
+      &nbsp;·&nbsp; Verified {{ '✓' if t.m_verified else ('FAILED' if t.m_failed else '—') }}
+      &nbsp;·&nbsp; Committed {{ '✓' if t.m_committed else '—' }}
+      {% if t.catalog_row %}
+      &nbsp;·&nbsp; <a class="dup-title-link" href="/media/catalog/{{ t.catalog_row.id }}">Catalog row #{{ t.catalog_row.id }}</a>
+      <a class="btn btn-ghost" style="padding:1px 8px;font-size:0.75rem" href="/media/catalog/{{ t.catalog_row.id }}">Open Catalog Entry</a>
+      {% elif not t.m_encoded %}
+      &nbsp;·&nbsp; <span style="color:var(--muted)">not committed</span>
+      {% endif %}
+    </div>
+    {% endif %}
 
     <!-- Possible-duplicate panel (Phase 2B, advisory only) -->
     <div id="dup-panel-{{ t.title_num }}">

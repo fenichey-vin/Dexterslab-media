@@ -34,8 +34,8 @@
       <tr><th>Verified</th><td>{{ 'Yes' if row.state == 'verified' else 'No' }}</td></tr>
       <tr><th>Library path</th>
           <td style="font-family:'Courier New',monospace;font-size:0.85rem">{{ row.library_path }}</td></tr>
-      <tr><th>Job ID</th>
-          <td>{% if row.job_id %}<a href="/media/job/{{ row.job_id }}">{{ row.job_id }}</a>{% else %}<span style="color:var(--muted)">— (library import, no owning job)</span>{% endif %}</td></tr>
+      <tr><th>Produced by</th>
+          <td>{% if row.job_id %}Job <a href="/media/job/{{ row.job_id }}">{{ row.job_id }}</a>{% else %}<span style="color:var(--muted)">— (library import, no owning job)</span>{% endif %}</td></tr>
       <tr><th>Recorded size</th><td>{{ row.filesize_bytes | filesize }}</td></tr>
       <tr><th>Actual size on disk</th>
           <td>{% if file_exists %}{{ actual_size | filesize }}{% else %}<span style="color:var(--muted)">file not found</span>{% endif %}</td></tr>

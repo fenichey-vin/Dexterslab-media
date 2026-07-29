@@ -188,6 +188,11 @@ def init_db():
         except Exception:
             pass
         _migrate_catalog_job_id_nullable(conn)
+        for col in ('rip_completed_at', 'encode_started_at', 'encode_completed_at'):
+            try:
+                conn.execute(f'ALTER TABLE jobs ADD COLUMN {col} TEXT')
+            except Exception:
+                pass
 
 
 def _now():
@@ -222,6 +227,22 @@ def set_job_status(job_id, status, notes=None):
                 'UPDATE jobs SET status=?, updated_at=? WHERE id=?',
                 (status, now, job_id)
             )
+
+
+_JOB_TIMESTAMP_FIELDS = ('rip_completed_at', 'encode_started_at', 'encode_completed_at')
+
+
+def set_job_timestamp(job_id, field):
+    """Permanently record when a job reached one of the three provenance
+    milestones not already covered by created_at/updated_at (Phase 3). Field
+    must be one of _JOB_TIMESTAMP_FIELDS -- whitelisted since it's
+    interpolated into the SQL column list. Never overwritten afterward by
+    set_job_status(), unlike updated_at -- this is what makes rip/encode
+    duration recoverable after a job moves on to later statuses."""
+    if field not in _JOB_TIMESTAMP_FIELDS:
+        raise ValueError(f'invalid job timestamp field: {field}')
+    with _db() as conn:
+        conn.execute(f'UPDATE jobs SET {field}=? WHERE id=?', (_now(), job_id))
 
 
 def increment_title_count(job_id):
