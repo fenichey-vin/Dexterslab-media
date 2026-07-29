@@ -475,3 +475,244 @@ def _scan_season(show, season, season_dir, result):
             })
             continue
         _record_candidate(result, f, {'type': 'tv_episode', 'show': show, 'season': season, 'episode': episode})
+
+
+# ── Duplicate visibility (Phase 2B) ──────────────────────────────────────────
+# Read-only, advisory-only duplicate detection. Never inserts, updates, or
+# deletes a catalog row or job record, never touches the filesystem, never
+# blocks a caller. Deterministic only -- no fuzzy/similarity matching, no AI,
+# no external APIs. Reuses the same classification dict shape already used
+# everywhere else in this app (titles.classification / catalog.classification)
+# -- there is no second title parser here, only a comparison over that same
+# structured data.
+
+_SKIP_TYPES = ('play_all', 'deleted', 'unknown')
+_DUP_CATALOG_STATES = ('verified', 'pending', 'committed', 'failed')
+_ACTIVE_JOB_STATUSES = ('ingesting', 'review', 'approved', 'queued', 'encoding')
+
+_CONFIDENCE_RANK = {'HIGH': 0, 'MEDIUM': 1, 'LOW': 2}
+_STATE_RELEVANCE = {
+    'verified': 0, 'committed': 1, 'pending': 2,
+    'staged_job': 3, 'active_job': 4, 'uncataloged_completed_job': 5,
+    'failed': 6,
+}
+
+
+def _normalize_title(s):
+    """Deterministic string canonicalization for comparison -- NOT a parser
+    and NOT fuzzy matching. Lowercases, folds common filename separators
+    (./_) to spaces, strips punctuation, collapses whitespace."""
+    if not s:
+        return ''
+    s = str(s).lower()
+    s = re.sub(r'[._]+', ' ', s)
+    s = re.sub(r'[^a-z0-9 ]+', '', s)
+    return re.sub(r'\s+', ' ', s).strip()
+
+
+def _movie_match(cls, other):
+    """Movie/documentary/special matching. Returns (confidence, reasons) or
+    None. Type must match exactly; specials additionally require the show
+    field to match (two different shows' "Special Features 1" must not
+    collide). No similarity/edit-distance tier -- exact normalized-title
+    equality is required for any confidence level."""
+    ctype = cls.get('type')
+    if not ctype or other.get('type') != ctype:
+        return None
+
+    title1 = _normalize_title(cls.get('movie_title') or cls.get('title'))
+    title2 = _normalize_title(other.get('movie_title') or other.get('title'))
+    if not title1 or title1 != title2:
+        return None
+
+    if ctype == 'special':
+        show1 = _normalize_title(cls.get('show'))
+        show2 = _normalize_title(other.get('show'))
+        if show1 != show2:
+            return None
+
+    reasons = ['Same normalized title', 'Same media type']
+    year1, year2 = cls.get('year'), other.get('year')
+    if year1 and year2:
+        if year1 == year2:
+            reasons.append('Same year')
+            return 'HIGH', reasons
+        reasons.append(f'Year differs ({year1} vs {year2})')
+        reasons.append('Possible remake or alternate edition')
+        return 'LOW', reasons
+
+    reasons.append('Year missing on one side — cannot confirm or rule out')
+    return 'MEDIUM', reasons
+
+
+def _tv_match(cls, other):
+    """TV episode matching. Returns (confidence, reasons) or None. Same show
+    with differing season or episode (both sides present) is a different
+    item, never a match. Same show alone, with neither season nor episode
+    confirmed equal, is too weak to be a candidate at all."""
+    if cls.get('type') != 'tv_episode' or other.get('type') != 'tv_episode':
+        return None
+
+    show1 = _normalize_title(cls.get('show'))
+    show2 = _normalize_title(other.get('show'))
+    if not show1 or show1 != show2:
+        return None
+
+    season1, season2 = cls.get('season'), other.get('season')
+    ep1, ep2 = cls.get('episode'), other.get('episode')
+
+    if season1 and season2 and season1 != season2:
+        return None
+    if ep1 and ep2 and ep1 != ep2:
+        return None
+
+    reasons = ['Same normalized series title', 'Same media type']
+    have_season = bool(season1 and season2)
+    have_ep = bool(ep1 and ep2)
+
+    if have_season and have_ep:
+        reasons.append('Same season and episode')
+        et1, et2 = cls.get('episode_title'), other.get('episode_title')
+        if et1 and et2 and _normalize_title(et1) == _normalize_title(et2):
+            reasons.append('Same episode title')
+        return 'HIGH', reasons
+
+    if have_season or have_ep:
+        reasons.append('Same season/episode identity, but episode metadata is incomplete on one side')
+        return 'MEDIUM', reasons
+
+    return None  # same series alone is never enough
+
+
+def find_possible_duplicates(cls, exclude_job_id=None, exclude_title_num=None):
+    """Deterministic, read-only advisory duplicate check for a single
+    classification dict (the same shape used everywhere else in this app).
+    Compares against catalog rows (both sources, states verified/pending/
+    committed/failed) and job history (active/staged/uncataloged-complete
+    jobs), excluding only the exact (job_id, title_num) being checked.
+    Never writes to the database, never touches the filesystem, never
+    blocks the caller. Returns a sorted list of candidate dicts, or [] if
+    none -- callers should treat [] as "no panel", not an error.
+    """
+    ctype = cls.get('type')
+    if not ctype or ctype in _SKIP_TYPES:
+        return []
+
+    matcher = _tv_match if ctype == 'tv_episode' else _movie_match
+    candidates = []
+
+    # 1. Catalog rows -- both sources, four informational states.
+    all_rows = db.get_all_catalog_rows()
+    by_path = {row['library_path']: row for row in all_rows}
+
+    for row in all_rows:
+        if row['state'] not in _DUP_CATALOG_STATES:
+            continue
+        if row['job_id'] == exclude_job_id and row['title_num'] == exclude_title_num:
+            continue
+
+        other = {
+            'type': row['type'], 'movie_title': row['movie_title'], 'year': row['year'],
+            'show': row['show'], 'season': row['season'], 'episode': row['episode'],
+            'episode_title': row['episode_title'],
+        }
+        m = matcher(cls, other)
+        if not m:
+            continue
+        confidence, reasons = m[0], list(m[1])
+
+        if row['state'] == 'verified':
+            reasons.append('Existing verified catalog entry')
+        elif row['state'] == 'committed':
+            reasons.append('Existing committed catalog entry (not yet verified)')
+        elif row['state'] == 'pending':
+            reasons.append('Existing catalog entry not yet verified')
+        elif row['state'] == 'failed':
+            reasons.append('Existing catalog entry FAILED verification — file may be missing or unreadable')
+
+        candidates.append({
+            'confidence': confidence, 'reasons': reasons,
+            'label': row['label'], 'type': row['type'],
+            'movie_title': row['movie_title'], 'year': row['year'],
+            'show': row['show'], 'season': row['season'], 'episode': row['episode'],
+            'episode_title': row['episode_title'],
+            'source': row['source'], 'state': row['state'],
+            'library_path': row['library_path'],
+            'job_id': row['job_id'], 'catalog_id': row['id'],
+            'verified': row['state'] == 'verified',
+            'has_catalog_row': True,
+        })
+
+    # 2. Job history -- active / staged / uncataloged-complete.
+    from app import _route_library, _cls_label
+
+    for job in db.get_all_jobs():
+        jid, status = job['id'], job['status']
+        if status == 'error':
+            continue
+        if status in _ACTIVE_JOB_STATUSES:
+            job_source = 'active_job'
+        elif status == 'staged':
+            job_source = 'staged_job'
+        elif status == 'complete':
+            job_source = 'uncataloged_completed_job'
+        else:
+            continue
+
+        for t in db.get_titles(jid):
+            if jid == exclude_job_id and t['title_num'] == exclude_title_num:
+                continue
+            other = t.get('classification')
+            if not other or other.get('type') in _SKIP_TYPES:
+                continue
+
+            if job_source == 'uncataloged_completed_job':
+                # Only titles with no catalog row of their own belong here --
+                # ones that do are already covered by the catalog-row pass
+                # above (as a mediaintel_job / library_import candidate).
+                if db.get_catalog_row(jid, t['title_num']):
+                    continue
+
+            m = matcher(cls, other)
+            if not m:
+                continue
+            confidence, reasons = m[0], list(m[1])
+
+            if job_source == 'active_job':
+                reasons.append(f'Another copy is in progress — job status: {status}')
+            elif job_source == 'staged_job':
+                reasons.append('Encoded and staged, not yet committed to the library')
+            else:
+                reasons.append('Job completed but has no catalog record of its own')
+                expected_path = _route_library(other, t['title_num'])
+                if expected_path and str(expected_path) in by_path:
+                    holder = by_path[str(expected_path)]
+                    reasons.append(
+                        f"Expected library path conflicts with existing catalog row "
+                        f"#{holder['id']} ({holder['label']})"
+                    )
+
+            candidates.append({
+                'confidence': confidence, 'reasons': reasons,
+                'label': _cls_label(other, t['title_num']), 'type': other.get('type'),
+                'movie_title': other.get('movie_title'), 'year': other.get('year'),
+                'show': other.get('show'), 'season': other.get('season'),
+                'episode': other.get('episode'), 'episode_title': other.get('episode_title'),
+                'source': job_source, 'state': status,
+                'library_path': None,
+                'job_id': jid, 'catalog_id': None,
+                'verified': False,
+                'has_catalog_row': False,
+            })
+
+    def _sort_key(c):
+        relevance_key = c['state'] if c['source'] in ('mediaintel_job', 'library_import') else c['source']
+        return (
+            _CONFIDENCE_RANK.get(c['confidence'], 9),
+            _STATE_RELEVANCE.get(relevance_key, 9),
+            (c['label'] or '').lower(),
+            c['year'] or 0,
+        )
+
+    candidates.sort(key=_sort_key)
+    return candidates

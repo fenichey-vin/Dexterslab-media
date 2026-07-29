@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+{% block title %}{{ row.label }} — Catalog Detail — Media Intel{% endblock %}
+
+{% block content %}
+<div class="page-header">
+  <div>
+    <a href="/media/catalog-status" class="back-link">← Catalog Status</a>
+    <h1>{{ row.label }}</h1>
+    <div class="header-meta">
+      Catalog row #{{ row.id }} — read-only view, nothing here deletes, moves, or fixes anything
+    </div>
+  </div>
+  <div class="job-actions">
+    <span class="badge cat-{{ row.state }}">{{ row.state | capitalize }}</span>
+  </div>
+</div>
+
+<section class="job-section">
+  <table class="rip-table">
+    <tbody>
+      <tr><th>Title</th><td>{{ row.label }}</td></tr>
+      <tr><th>Media type</th><td>{{ row.type | replace('_',' ') | title }}</td></tr>
+      {% if row.type == 'tv_episode' %}
+      <tr><th>Show</th><td>{{ row.show or '—' }}</td></tr>
+      <tr><th>Season / Episode</th>
+          <td>{% if row.season %}S{{ '%02d'|format(row.season|int) }}{% endif %}{% if row.episode %}E{{ '%02d'|format(row.episode|int) }}{% endif %}{% if not row.season and not row.episode %}—{% endif %}</td></tr>
+      <tr><th>Episode title</th><td>{{ row.episode_title or '—' }}</td></tr>
+      {% elif row.type in ('movie', 'documentary') %}
+      <tr><th>Movie title</th><td>{{ row.movie_title or '—' }}</td></tr>
+      <tr><th>Year</th><td>{{ row.year or '—' }}</td></tr>
+      {% endif %}
+      <tr><th>Source</th><td><span class="badge">{{ row.source }}</span></td></tr>
+      <tr><th>Catalog state</th><td><span class="badge cat-{{ row.state }}">{{ row.state }}</span></td></tr>
+      <tr><th>Verified</th><td>{{ 'Yes' if row.state == 'verified' else 'No' }}</td></tr>
+      <tr><th>Library path</th>
+          <td style="font-family:'Courier New',monospace;font-size:0.85rem">{{ row.library_path }}</td></tr>
+      <tr><th>Job ID</th>
+          <td>{% if row.job_id %}<a href="/media/job/{{ row.job_id }}">{{ row.job_id }}</a>{% else %}<span style="color:var(--muted)">— (library import, no owning job)</span>{% endif %}</td></tr>
+      <tr><th>Recorded size</th><td>{{ row.filesize_bytes | filesize }}</td></tr>
+      <tr><th>Actual size on disk</th>
+          <td>{% if file_exists %}{{ actual_size | filesize }}{% else %}<span style="color:var(--muted)">file not found</span>{% endif %}</td></tr>
+      {% if row.fail_reason %}
+      <tr><th>Failure reason</th><td><span class="badge cat-failed">{{ row.fail_reason }}</span></td></tr>
+      {% endif %}
+      <tr><th>Committed / imported at</th><td>{{ row.committed_at or '—' }}</td></tr>
+      <tr><th>Verified at</th><td>{{ row.verified_at or '—' }}</td></tr>
+      <tr><th>Cleaned at</th><td>{{ row.cleaned_at or '—' }}</td></tr>
+    </tbody>
+  </table>
+</section>
+{% endblock %}

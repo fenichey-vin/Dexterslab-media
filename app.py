@@ -218,6 +218,13 @@ def job_detail(job_id):
         return 'Job not found', 404
     titles = db.get_titles(job_id)
     classified = sum(1 for t in titles if t['classification'] is not None)
+    # Advisory duplicate visibility (Phase 2B) -- read-only, computed fresh on
+    # every load so returning to a job later still shows current candidates.
+    for t in titles:
+        cls = t.get('classification')
+        if cls:
+            t['duplicates'] = catalog.find_possible_duplicates(
+                cls, exclude_job_id=job_id, exclude_title_num=t['title_num'])
     return render_template('job.html', job=job, titles=titles,
                            classified_count=classified, total_count=len(titles))
 
@@ -229,12 +236,15 @@ def classify_title(job_id, n):
     data = request.get_json(silent=True)
     if not data or 'type' not in data:
         return jsonify({'error': 'Missing type field'}), 400
+    # Advisory duplicate check runs against the posted metadata *before* the
+    # classification is committed -- read-only, never blocks the save below.
+    duplicates = catalog.find_possible_duplicates(data, exclude_job_id=job_id, exclude_title_num=n)
     db.save_classification(job_id, n, data)
     # Promote job from ingesting → review once first classification arrives
     job = db.get_job(job_id)
     if job and job['status'] == 'ingesting':
         db.set_job_status(job_id, 'review')
-    return jsonify({'ok': True})
+    return jsonify({'ok': True, 'duplicates': duplicates})
 
 
 @app.route('/media/job/<job_id>/title/<int:n>/unclassify', methods=['POST'])
@@ -1421,6 +1431,26 @@ def catalog_status():
                            failed_rows=failed_rows,
                            conflicts=conflict_data['conflicts'],
                            unroutable=conflict_data['unroutable'])
+
+
+@app.route('/media/catalog/<int:catalog_id>')
+def catalog_detail(catalog_id):
+    """Read-only detail view of a single catalog row (Phase 2B). Used as the
+    'View Existing' / clickable-title destination for duplicate candidates
+    that have their own catalog row. One on-demand stat() for the actual
+    file size -- same pattern catalog_status() already uses for failed rows,
+    done here for exactly one row, not a scan.
+    """
+    row = db.get_catalog_row_by_id(catalog_id)
+    if not row:
+        return 'Catalog row not found', 404
+    path = Path(row['library_path'])
+    try:
+        actual_size = path.stat().st_size if path.exists() else None
+    except OSError:
+        actual_size = None
+    return render_template('catalog_detail.html', row=row, actual_size=actual_size,
+                           file_exists=path.exists())
 
 
 @app.route('/media/catalog/<int:catalog_id>/reverify', methods=['POST'])

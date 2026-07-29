@@ -606,6 +606,60 @@ code {
   vertical-align: middle;
 }
 
+/* ─── Possible-duplicate panel (Phase 2B, advisory only) ─────────────────────── */
+.dup-panel {
+  margin: 0 16px 16px;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 14px 16px;
+}
+
+.dup-panel-header {
+  font-size: 0.78rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text);
+  margin-bottom: 10px;
+}
+
+.dup-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px 12px;
+  margin-bottom: 10px;
+}
+.dup-card:last-child { margin-bottom: 0; }
+
+.dup-card-header { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 6px; }
+
+.dup-title-link { color: var(--text); font-weight: 600; text-decoration: none; }
+.dup-title-link:hover { color: var(--accent); text-decoration: underline; }
+
+.dup-meta { font-size: 0.8rem; color: var(--muted); margin: 2px 0; }
+
+.dup-reasons { font-size: 0.8rem; color: var(--muted); margin: 6px 0 8px 18px; }
+.dup-reasons li { margin-bottom: 2px; }
+
+.dup-actions { margin-top: 4px; }
+
+/* Confidence communicates certainty (how sure is this match), not severity --
+   one color family at three intensities, no red/yellow alarm palette. */
+.dup-conf {
+  display: inline-block;
+  padding: 2px 9px;
+  border-radius: 99px;
+  font-size: 0.72rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.dup-conf-high   { background: var(--accent); color: #05132a; }
+.dup-conf-medium { background: rgba(74,158,255,.25); color: var(--accent); }
+.dup-conf-low    { background: transparent; border: 1px solid var(--border); color: var(--muted); }
+
 /* ─── Disc ID card ───────────────────────────────────────────────────────────── */
 .disc-id-card {
   background: rgba(74,158,255,.05);

@@ -245,6 +245,41 @@
       {% endif %}
     </div>
 
+    <!-- Possible-duplicate panel (Phase 2B, advisory only) -->
+    <div id="dup-panel-{{ t.title_num }}">
+      {% if t.duplicates %}
+      <div class="dup-panel">
+        <div class="dup-panel-header">Possible Duplicate</div>
+        {% for d in t.duplicates %}
+        {% set href = ('/media/catalog/' ~ d.catalog_id) if d.catalog_id else ('/media/job/' ~ d.job_id) %}
+        <div class="dup-card">
+          <div class="dup-card-header">
+            <span class="dup-conf dup-conf-{{ d.confidence | lower }}">{{ d.confidence }}</span>
+            <a class="dup-title-link" href="{{ href }}">{{ d.label }}</a>
+          </div>
+          <div class="dup-meta">
+            Source: {{ d.source | replace('_',' ') }}
+            &nbsp;·&nbsp; State: {{ d.state }}
+            &nbsp;·&nbsp; {{ 'Verified' if d.verified else 'Not verified' }}
+            {% if not d.has_catalog_row %}&nbsp;·&nbsp; job history only, no catalog row{% endif %}
+          </div>
+          {% if d.library_path %}
+          <div class="dup-meta" style="font-family:'Courier New',monospace;font-size:0.75rem">{{ d.library_path }}</div>
+          {% endif %}
+          <ul class="dup-reasons">
+            {% for reason in d.reasons %}
+            <li>{{ reason }}</li>
+            {% endfor %}
+          </ul>
+          <div class="dup-actions">
+            <a class="btn btn-ghost" href="{{ href }}">View Existing</a>
+          </div>
+        </div>
+        {% endfor %}
+      </div>
+      {% endif %}
+    </div>
+
     <!-- Classification type buttons -->
     {% if job.status not in ('approved','encoding','complete') %}
     <div class="classify-buttons">

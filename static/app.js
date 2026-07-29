@@ -107,6 +107,7 @@ function submitClassification(event, n) {
     .then(r => {
       if (r.ok) {
         _updateDisplay(n, data);
+        _renderDuplicates(n, r.duplicates);
         hideForm(n);
         _updateProgress();
         const wrap = qs(`cls-form-${n}`);
@@ -125,6 +126,7 @@ function quickClassify(n, type) {
     .then(r => {
       if (r.ok) {
         _updateDisplay(n, data);
+        _renderDuplicates(n, r.duplicates);
         hideForm(n);
         hide(qs(`claude-panel-${n}`));
         _updateProgress();
@@ -222,6 +224,54 @@ function _updateDisplay(n, cls) {
   // Mark card as classified
   const card = qs(`title-card-${n}`);
   if (card) card.classList.add('classified');
+}
+
+// ── Possible-duplicate panel (Phase 2B, advisory only, no page reload) ────────
+// Mirrors the Jinja-rendered panel in job.html so a live classify (no reload)
+// looks identical to what a fresh page load would render for the same data.
+
+function _escapeHtml(s) {
+  const div = document.createElement('div');
+  div.textContent = s == null ? '' : String(s);
+  return div.innerHTML;
+}
+
+function _renderDuplicates(n, duplicates) {
+  const wrap = qs(`dup-panel-${n}`);
+  if (!wrap) return;
+  if (!duplicates || !duplicates.length) {
+    wrap.innerHTML = '';
+    return;
+  }
+
+  const cards = duplicates.map(d => {
+    const href = d.catalog_id ? `/media/catalog/${d.catalog_id}` : `/media/job/${d.job_id}`;
+    const reasons = (d.reasons || []).map(r => `<li>${_escapeHtml(r)}</li>`).join('');
+    const pathLine = d.library_path
+      ? `<div class="dup-meta" style="font-family:'Courier New',monospace;font-size:0.75rem">${_escapeHtml(d.library_path)}</div>`
+      : '';
+    const noRowNote = d.has_catalog_row ? '' : '&nbsp;·&nbsp; job history only, no catalog row';
+    return `
+      <div class="dup-card">
+        <div class="dup-card-header">
+          <span class="dup-conf dup-conf-${String(d.confidence).toLowerCase()}">${_escapeHtml(d.confidence)}</span>
+          <a class="dup-title-link" href="${href}">${_escapeHtml(d.label)}</a>
+        </div>
+        <div class="dup-meta">
+          Source: ${_escapeHtml((d.source || '').replace(/_/g, ' '))}
+          &nbsp;·&nbsp; State: ${_escapeHtml(d.state)}
+          &nbsp;·&nbsp; ${d.verified ? 'Verified' : 'Not verified'}
+          ${noRowNote}
+        </div>
+        ${pathLine}
+        <ul class="dup-reasons">${reasons}</ul>
+        <div class="dup-actions">
+          <a class="btn btn-ghost" href="${href}">View Existing</a>
+        </div>
+      </div>`;
+  }).join('');
+
+  wrap.innerHTML = `<div class="dup-panel"><div class="dup-panel-header">Possible Duplicate</div>${cards}</div>`;
 }
 
 function _updateProgress() {
