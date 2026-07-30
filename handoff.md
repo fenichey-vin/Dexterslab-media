@@ -1,7 +1,8 @@
 # MediaIntel — Handoff
 
 Last updated: 2026-07-30, end of day. All of today's work is committed and pushed to `origin/main`
-(see "Repo state" at the bottom for the exact commit). **The server was fully rebooted** at the end
+at `180dfaa` ("Replace TV episode guessing with TMDb lookup; fix rip workflow papercuts").
+**The server was fully rebooted** at the end
 of this session (not just `mediaintel.service` — a full `reboot`), at your explicit request, partly
 to retest the optical drive issue described below. This session ended immediately when the reboot
 was issued, so there was no way to confirm anything post-reboot — check `systemctl status
