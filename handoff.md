@@ -184,12 +184,16 @@ and the scan hung until timeout rather than completing gracefully. A logical dev
 power-cycle the actual drive hardware, so this doesn't rule out the laser/optics theory above —
 it just means the sysfs-level reset alone wasn't enough.
 
-The user has previously seen a **full physical server restart** resolve similar symptoms before.
-**Decision made at end of this session: doing the full reboot** (see top of this doc) — partly as
-routine end-of-day housekeeping, partly to retest this. If discs still fail identically after a
-real power cycle, that's a much stronger signal it's genuinely the drive (laser wear) rather than
-anything a reset/reboot can fix, and the next step would be sourcing a replacement drive or trying
-a third one if available — not more resets.
+**Update, post-reboot (2026-07-30 11:4x UTC): the full reboot did NOT fix it.** Re-ran the exact
+same scan on `sr0` with `SATC_DISC3` still in the drive — identical result: same error on
+`/VIDEO_TS/VTS_02_1.VOB`, same "Title #N in broken titleset was skipped" for titles 7-27, same 3
+clean titles. A genuine power cycle failing to change anything at all is strong, near-conclusive
+evidence this is real drive hardware wear (laser/optics), not a stuck software/bus/controller
+state — there's nothing left to try at the software level. **Next step should be trying a
+different/replacement drive**, not another reset or reboot. `sr1` (the second drive) was not
+re-tested with this same disc post-reboot — worth doing if a definitive "is it just sr0" answer is
+wanted, though the original two-different-discs-same-failure-point evidence already pointed at
+`sr0` specifically.
 
 ## Current data snapshot (end of day, 2026-07-30, before the reboot)
 
@@ -296,8 +300,10 @@ a third one if available — not more resets.
 - Branch: `main` only, local and remote in sync (see commit at the very top of this doc).
 - Working tree clean — everything from today (`app.py`, `config.py`, `templates/dashboard.html`,
   `templates/job.html`, `templates/rip.html`, `tmdb.py` new, this file) committed and pushed.
-- Server was **fully rebooted** at the end of this session (not just the service) — see the top of
-  this doc. First thing to check on return: `systemctl status mediaintel`, then `/media/` and a job
-  page to confirm the TMDb/live-progress/one-click fixes actually came up.
-- Service running (PID recorded in the data-snapshot section above, restarted 2026-07-29 19:12 UTC
-  after today's three fixes were deployed) — no rip/encode was active at that restart.
+- Server was **fully rebooted** at the end of the 2026-07-30 session (not just the service).
+  **Verified post-reboot** (2026-07-30 11:4x UTC): came back up clean (`enabled` unit, auto-started,
+  PID 5744), `journalctl -b` has zero errors/exceptions, `/media/` and `/media/progress.json` both
+  return 200, and the TV job page confirms "Look Up Episode" wording — all four of today's fixes
+  (TMDb lookup, one-click classify, season-lock, live-progress polling) are confirmed live, not
+  just built. The optical drive issue was retested post-reboot and did **not** improve — see
+  "Optical drive hardware issue" above for the definitive (unresolved) result.
