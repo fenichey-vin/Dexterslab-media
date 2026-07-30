@@ -26,6 +26,7 @@ from config import (REVIEW_DIR, DB_PATH, PORT, ANTHROPIC_API_KEY, ANTHROPIC_MODE
                     HB_PRESET, HB_FILTERS, HB_AUDIO)
 import db
 import catalog
+import tmdb
 from disc import detect_drives, scan_disc, flag_titles, rip_title, get_duration, take_screenshots
 
 app = Flask(__name__, static_url_path='/media/static')
@@ -373,13 +374,19 @@ def save_disc_context(job_id):
 
 @app.route('/media/job/<job_id>/classify-all', methods=['POST'])
 def classify_all(job_id):
-    """Re-run Claude auto-classification on every unclassified title in the job."""
-    if not ANTHROPIC_API_KEY:
-        return jsonify({'error': 'ANTHROPIC_API_KEY not configured'}), 503
+    """Classify every unclassified title in the job. TV titles are resolved
+    deterministically (disc position -> episode number, TMDb -> episode
+    title) -- no screenshots, no Claude. Movie/special/documentary titles
+    still use Claude auto-classification from screenshots, unchanged.
+    """
     job = db.get_job(job_id)
     if not job:
         return jsonify({'error': 'Job not found'}), 404
     disc_context = job.get('disc_context')
+    is_tv = bool(disc_context and disc_context.get('type') == 'tv')
+    if not is_tv and not ANTHROPIC_API_KEY:
+        return jsonify({'error': 'ANTHROPIC_API_KEY not configured'}), 503
+
     titles = db.get_titles(job_id)
     to_classify = [t for t in titles if t['classification'] is None]
     if not to_classify:
@@ -390,6 +397,8 @@ def classify_all(job_id):
             try:
                 if t['duration_secs'] and t['duration_secs'] < 480:
                     _auto_classify_short(job_id, t['title_num'], disc_context)
+                elif is_tv:
+                    _auto_classify_tv_from_lookup(job_id, t['title_num'], disc_context, titles)
                 else:
                     _auto_classify_one(job_id, t['title_num'], disc_context)
             except Exception:
@@ -954,11 +963,21 @@ def _build_classify_prompt(title_num, all_titles, context, dur_str, size_str, fl
         season_str   = f' Season {season}' if season else ''
         ep_list_hint = (f' Episodes on this disc: {", ".join(str(e) for e in episodes)}.' if episodes else '')
         season_val   = season if isinstance(season, int) else 0
+        # The operator has already confirmed the season from the disc case --
+        # Claude's job is to place the episode within it, not to second-guess
+        # the season itself (shows with seasons split across multiple discs,
+        # or with content Claude misremembers, otherwise invite it to
+        # "correct" a season number that is actually already right).
+        season_lock = (
+            f'\nThe season number above ({season_val}) is operator-confirmed from the '
+            f'disc case -- always return it unchanged in your reply. Only determine the '
+            f'episode number and title within that season.'
+        ) if season_val else ''
 
         return (
             f'These are screenshots from a {show}{season_str} episode.\n'
             f'Duration: {dur_str}  |  File size: {size_str}  |  Flags: {flags}'
-            f'{ep_list_hint}{position_hint}\n\n'
+            f'{ep_list_hint}{position_hint}{season_lock}\n\n'
             f'Identify which specific episode this is. Examine on-screen text (title cards,\n'
             f'subtitles, signage), character names and faces, locations, and plot moments.\n'
             f'You MUST provide the episode number and title — do not leave them blank.\n'
@@ -1094,6 +1113,58 @@ def _auto_classify_short(job_id, title_num, disc_context):
         'confidence': 'high',
         'reasoning':  'Auto-classified: duration under 8 minutes.',
     })
+
+
+# ── TV episode identification via TMDb lookup (not screenshot guessing) ──────
+
+def _disc_episode_number(title_num, all_titles, episodes):
+    """Map a title's position among eligible (non-play_all, >15min) titles on
+    the disc to the operator-provided 'episodes on disc' list. Returns None
+    if the title isn't eligible or its position falls outside that list --
+    this only reads off the operator's own input, it never guesses a number.
+    """
+    ep_nums = sorted(
+        t['title_num'] for t in all_titles
+        if 'play_all' not in (t['flags'] or [])
+        and (t['duration_secs'] or 0) > 900
+    )
+    if title_num not in ep_nums or not episodes:
+        return None
+    pos = ep_nums.index(title_num)
+    if pos >= len(episodes):
+        return None
+    return episodes[pos]
+
+
+def _auto_classify_tv_from_lookup(job_id, title_num, context, all_titles):
+    """Classify one TV title using the operator-confirmed show/season/disc
+    position (already fully deterministic, see _disc_episode_number) plus a
+    TMDb lookup for the episode *title* -- no screenshots, no Claude, no
+    guessing. If TMDb has no key configured or can't resolve the episode,
+    the season/episode number are still saved (they never depended on TMDb
+    to begin with); only episode_title is left blank with confidence 'low'.
+    Never falls back to a guessed title.
+    """
+    show   = context.get('show', '')
+    season = context.get('season')
+    episode = _disc_episode_number(title_num, all_titles, context.get('episodes') or [])
+    if episode is None:
+        return False
+
+    title_text = tmdb.lookup_episode_title(show, season, episode)
+    classification = {
+        'type': 'tv_episode', 'show': show, 'season': season, 'episode': episode,
+        'episode_title': title_text or '',
+        'confidence': 'high' if title_text else 'low',
+        'reasoning': (
+            f'Looked up from TMDb: {show} S{season:02d}E{episode:02d}.' if title_text
+            else f'TMDb lookup found no title for {show} S{season:02d}E{episode:02d} -- '
+                 f'season/episode number are from disc position, title needs manual entry.'
+        ),
+        '_source': 'tmdb_lookup',
+    }
+    db.save_classification(job_id, title_num, classification)
+    return True
 
 
 # ── Auto-classify a single title in the background ────────────────────────────
@@ -1392,10 +1463,6 @@ def _import_mkv_bg(job_id, title_paths):
 
 @app.route('/media/job/<job_id>/title/<int:n>/ask-claude', methods=['POST'])
 def ask_claude(job_id, n):
-    api_key = ANTHROPIC_API_KEY
-    if not api_key:
-        return jsonify({'error': 'ANTHROPIC_API_KEY is not configured on this server.'}), 503
-
     title = db.get_title(job_id, n)
     if not title:
         return jsonify({'error': 'Title not found'}), 404
@@ -1403,6 +1470,35 @@ def ask_claude(job_id, n):
     job        = db.get_job(job_id)
     context    = _get_effective_context(job)
     all_titles = db.get_titles(job_id)
+
+    # TV: deterministic disc position + TMDb lookup, no screenshots, no
+    # Claude call at all -- same response shape the UI already expects.
+    if context and context.get('type') == 'tv':
+        show    = context.get('show', '')
+        season  = context.get('season')
+        episode = _disc_episode_number(n, all_titles, context.get('episodes') or [])
+        if episode is None:
+            return jsonify({
+                'type': 'tv_episode', 'show': show, 'season': season, 'episode': 0,
+                'episode_title': '', 'confidence': 'low',
+                'reasoning': 'Could not determine this title\'s disc position or episode '
+                             'number from "Episodes on disc" -- check that list is complete.',
+            })
+        title_text = tmdb.lookup_episode_title(show, season, episode)
+        return jsonify({
+            'type': 'tv_episode', 'show': show, 'season': season, 'episode': episode,
+            'episode_title': title_text or '',
+            'confidence': 'high' if title_text else 'low',
+            'reasoning': (
+                f'Looked up from TMDb: {show} S{season:02d}E{episode:02d}.' if title_text
+                else f'TMDb lookup found no title for {show} S{season:02d}E{episode:02d} -- '
+                     f'season/episode number are from disc position, title needs manual entry.'
+            ),
+        })
+
+    api_key = ANTHROPIC_API_KEY
+    if not api_key:
+        return jsonify({'error': 'ANTHROPIC_API_KEY is not configured on this server.'}), 503
 
     content = []
 
@@ -1553,6 +1649,26 @@ def catalog_reverify(catalog_id):
     if row is None:
         return jsonify({'error': 'Catalog row not found'}), 404
     return jsonify({'ok': True, 'state': row['state'], 'fail_reason': row['fail_reason']})
+
+
+# ── Live dashboard progress (polling, no page reload) ─────────────────────────
+
+@app.route('/media/progress.json')
+def progress_json():
+    """Lightweight read-only polling endpoint for the dashboard. Returns
+    job-status buckets (so the client can detect when a job has moved
+    sections and a real reload is actually needed) plus the raw rip/encode
+    progress dicts (so the client can update progress bars in place the rest
+    of the time). No rendering, no writes -- safe to poll every couple of
+    seconds.
+    """
+    jobs = db.get_all_jobs()
+    buckets = {}
+    for j in jobs:
+        buckets.setdefault(j['status'], []).append(j['id'])
+    rip    = {j['id']: j['rip_progress']    for j in jobs if j.get('rip_progress')}
+    encode = {j['id']: j['encode_progress'] for j in jobs if j.get('encode_progress')}
+    return jsonify({'buckets': buckets, 'rip': rip, 'encode': encode, 'now': time.time()})
 
 
 # ── Healthcheck ───────────────────────────────────────────────────────────────

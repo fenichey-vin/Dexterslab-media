@@ -145,7 +145,11 @@
     <div style="flex:1;min-width:260px">
       <div style="font-size:0.78rem;font-weight:700;text-transform:uppercase;
                   letter-spacing:0.06em;color:var(--accent);margin-bottom:10px">
+        {% if job.disc_context and job.disc_context.type == 'tv' %}
+        Disc Context — for episode lookup
+        {% else %}
         Disc Context — for Claude identification
+        {% endif %}
       </div>
 
       <!-- Type -->
@@ -231,7 +235,7 @@
       </button>
       <button class="btn btn-encode" id="classify-all-btn" onclick="classifyAll()"
               style="white-space:nowrap">
-        Classify All with Claude
+        {% if job.disc_context and job.disc_context.type == 'tv' %}Look Up All Episodes{% else %}Classify All with Claude{% endif %}
       </button>
     </div>
   </div>
@@ -384,7 +388,7 @@
       <button class="cls-btn cls-btn-unknown"      onclick="quickClassify({{ t.title_num }}, 'unknown')">Unknown</button>
       <button class="cls-btn cls-btn-claude"       onclick="askClaude({{ t.title_num }})">
         <span id="claude-spinner-{{ t.title_num }}" class="hidden">⟳</span>
-        Ask Claude
+        {% if job.disc_context and job.disc_context.type == 'tv' %}Look Up Episode{% else %}Ask Claude{% endif %}
       </button>
     </div>
 
@@ -451,7 +455,7 @@
 
     <!-- Claude suggestion panel (hidden by default) -->
     <div class="claude-panel hidden" id="claude-panel-{{ t.title_num }}">
-      <div class="claude-panel-header">Claude Suggestion</div>
+      <div class="claude-panel-header">{% if job.disc_context and job.disc_context.type == 'tv' %}Episode Lookup{% else %}Claude Suggestion{% endif %}</div>
       <div class="claude-suggestion" id="claude-suggestion-{{ t.title_num }}"></div>
       <div class="claude-actions">
         <button class="btn btn-primary" onclick="applySuggestion({{ t.title_num }})">Apply</button>
@@ -528,18 +532,82 @@
     if (!ctx) { if (status) status.textContent = 'Enter a show name or movie title first.'; return; }
     apiPost(`/media/job/${JOB_ID}/context`, { disc_context: ctx })
       .then(r => {
-        if (status) status.textContent = r.ok ? 'Saved.' : ('Error: ' + (r.error || 'unknown'));
+        if (!r.ok) { if (status) status.textContent = 'Error: ' + (r.error || 'unknown'); return; }
+        const mismatch = _episodeCountMismatch(ctx);
+        if (mismatch) { if (status) status.textContent = mismatch; return; }
+        _maybeAutoClassifySingleTitle(ctx, status);
       })
       .catch(() => { if (status) status.textContent = 'Network error.'; });
+  }
+
+  // Advisory only -- never blocks the save. Catches the exact failure mode
+  // that left a 6th title with zero episode hint during auto-classify: an
+  // "Episodes on disc" list shorter (or longer) than the number of titles
+  // that actually look like episodes (excluding play_all/short titles),
+  // mirroring the same eligibility rule _build_classify_prompt() uses
+  // server-side.
+  function _episodeCountMismatch(ctx) {
+    if (ctx.type !== 'tv') return null;
+    const cards = document.querySelectorAll('.title-card');
+    let eligible = 0;
+    cards.forEach(card => {
+      if (!card.querySelector('.flag-play_all') && !card.querySelector('.flag-short')) eligible++;
+    });
+    const listed = (ctx.episodes || []).length;
+    if (listed === eligible) return null;
+    return `Saved — ⚠ you listed ${listed} episode${listed !== 1 ? 's' : ''}, but ${eligible} `
+         + `title${eligible !== 1 ? 's' : ''} on this disc look like episodes. Double-check `
+         + `"Episodes on disc" before running Classify All.`;
+  }
+
+  // One-click shortcut: a disc with exactly one (still-unclassified) title is
+  // almost always a single movie with no extras -- in that case the disc
+  // context we just saved already fully identifies the title, so classify it
+  // immediately instead of making the user reopen the form and click Save
+  // again to confirm the same title/year. Scoped narrowly on purpose: only
+  // fires for type 'movie' (a TV disc's episode number still needs picking
+  // per title) and only when there's a single title that isn't already
+  // classified (never overwrites a deliberate manual classification).
+  function _maybeAutoClassifySingleTitle(ctx, status) {
+    if (ctx.type !== 'movie') { if (status) status.textContent = 'Saved.'; return; }
+
+    const cards = document.querySelectorAll('.title-card');
+    if (cards.length !== 1 || cards[0].classList.contains('classified')) {
+      if (status) status.textContent = 'Saved.';
+      return;
+    }
+
+    const m = cards[0].id.match(/^title-card-(\d+)$/);
+    if (!m) { if (status) status.textContent = 'Saved.'; return; }
+    const n = parseInt(m[1], 10);
+
+    const data = { type: 'movie', movie_title: ctx.title };
+    if (ctx.year) data.year = ctx.year;
+
+    apiPost(`/media/job/${JOB_ID}/title/${n}/classify`, data)
+      .then(r => {
+        if (r.ok) {
+          _updateDisplay(n, data);
+          _renderDuplicates(n, r.duplicates);
+          _updateProgress();
+          if (status) status.textContent = `Saved — automatically classified the only title as "${ctx.title}${ctx.year ? ' (' + ctx.year + ')' : ''}".`;
+        } else {
+          if (status) status.textContent = 'Context saved, but auto-classify failed: ' + (r.error || 'unknown');
+        }
+      })
+      .catch(() => { if (status) status.textContent = 'Context saved, but auto-classify failed (network error).'; });
   }
 
   function classifyAll() {
     const ctx    = _buildCtx();
     const status = document.getElementById('ctx-status');
     const btn    = document.getElementById('classify-all-btn');
+    const label  = ctx && ctx.type === 'tv' ? 'Look Up All Episodes' : 'Classify All with Claude';
     if (!ctx) { if (status) status.textContent = 'Save disc context first.'; return; }
     if (btn) { btn.disabled = true; btn.textContent = 'Running…'; }
-    if (status) status.textContent = 'Saving context and queuing Claude classification…';
+    if (status) status.textContent = ctx.type === 'tv'
+      ? 'Saving context and looking up episode titles…'
+      : 'Saving context and queuing Claude classification…';
 
     apiPost(`/media/job/${JOB_ID}/context`, { disc_context: ctx })
       .then(() => apiPost(`/media/job/${JOB_ID}/classify-all`, {}))
@@ -548,12 +616,12 @@
           if (status) status.textContent = `Classifying ${r.queued} title(s) in background — refresh in a moment.`;
           setTimeout(() => location.reload(), 8000);
         } else {
-          if (btn) { btn.disabled = false; btn.textContent = 'Classify All with Claude'; }
+          if (btn) { btn.disabled = false; btn.textContent = label; }
           if (status) status.textContent = 'Error: ' + (r.error || 'unknown');
         }
       })
       .catch(() => {
-        if (btn) { btn.disabled = false; btn.textContent = 'Classify All with Claude'; }
+        if (btn) { btn.disabled = false; btn.textContent = label; }
         if (status) status.textContent = 'Network error.';
       });
   }

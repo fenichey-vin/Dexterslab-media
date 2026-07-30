@@ -21,6 +21,10 @@ PORT    = 8088
 ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY', '')
 ANTHROPIC_MODEL   = 'claude-haiku-4-5-20251001'
 
+# Used to look up real TV episode titles by season/episode number instead of
+# guessing them from screenshots (see tmdb.py). Free key from themoviedb.org.
+TMDB_API_KEY = os.environ.get('TMDB_API_KEY', '')
+
 # HandBrake preset used for all encodes
 HB_PRESET   = 'HQ 480p30 Surround'
 HB_FILTERS  = ['--comb-detect', '--decomb']

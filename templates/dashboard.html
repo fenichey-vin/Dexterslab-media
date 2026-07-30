@@ -3,7 +3,10 @@
 
 {% block head %}
 {% if active or encoding or enc_queue %}
-<meta http-equiv="refresh" content="5">
+<!-- Slow fallback only -- live progress is handled by JS polling below
+     (see extra_js). This just guarantees the page eventually catches up
+     even if JS fails for some reason. -->
+<meta http-equiv="refresh" content="60">
 {% endif %}
 {% endblock %}
 
@@ -35,23 +38,20 @@
     {% for job in active %}
     {% set p = job.rip_progress %}
     {% set stale = p and (now - p.ts) > 90 %}
-    <a href="/media/job/{{ job.id }}" class="job-card ingesting">
+    <a href="/media/job/{{ job.id }}" class="job-card ingesting" data-job-id="{{ job.id }}">
       <div class="job-card-name">{{ job.name }}</div>
-      {% if p %}
-      <div class="rip-progress-wrap {{ 'rip-stale' if stale else '' }}">
+      <div class="rip-progress-wrap {{ 'rip-stale' if stale else '' }}" style="{{ '' if p else 'display:none' }}">
         <div class="rip-track">
-          <div class="rip-fill" style="width:{{ p.pct }}%"></div>
+          <div class="rip-fill" style="width:{{ p.pct if p else 0 }}%"></div>
         </div>
         <div class="rip-meta">
-          <span class="rip-pct">{{ p.pct }}%</span>
-          {% if stale %}
-          <span class="rip-op">⚠ stalled — no update for {{ ((now - p.ts) / 60) | int }}m</span>
-          {% elif p.op %}
-          <span class="rip-op">{{ p.op }}</span>
-          {% endif %}
+          <span class="rip-pct">{{ p.pct if p else 0 }}%</span>
+          <span class="rip-op">
+            {%- if stale %}⚠ stalled — no update for {{ ((now - p.ts) / 60) | int }}m
+            {%- elif p and p.op %}{{ p.op }}{% endif -%}
+          </span>
         </div>
       </div>
-      {% endif %}
       <div class="job-card-meta">
         <span class="badge ingesting">Ripping…</span>
         <span>{{ job.title_count }} title{{ 's' if job.title_count != 1 else '' }} done</span>
@@ -139,21 +139,19 @@
   <div class="job-grid">
     {% for job in encoding %}
     {% set p = job.encode_progress %}
-    <a href="/media/job/{{ job.id }}" class="job-card encoding">
+    <a href="/media/job/{{ job.id }}" class="job-card encoding" data-job-id="{{ job.id }}">
       <div class="job-card-name">{{ job.name }}</div>
-      {% if p %}
-      <div class="enc-progress-wrap">
+      <div class="enc-progress-wrap" style="{{ '' if p else 'display:none' }}">
         <div class="rip-track">
-          <div class="enc-fill" style="width:{{ p.pct }}%"></div>
+          <div class="enc-fill" style="width:{{ p.pct if p else 0 }}%"></div>
         </div>
         <div class="rip-meta">
-          <span class="enc-pct">{{ "%.1f"|format(p.pct) }}%</span>
+          <span class="enc-pct">{{ "%.1f"|format(p.pct) if p else '0.0' }}%</span>
           <span class="rip-op">
-            {{ p.title }}{% if p.total > 1 %} ({{ p.idx }}/{{ p.total }}){% endif %}{% if p.fps %} &middot; {{ "%.1f"|format(p.fps) }} fps{% endif %}{% if p.eta_secs %} &middot; ETA {{ p.eta_secs | eta_format }}{% endif %}
+            {%- if p %}{{ p.title }}{% if p.total > 1 %} ({{ p.idx }}/{{ p.total }}){% endif %}{% if p.fps %} &middot; {{ "%.1f"|format(p.fps) }} fps{% endif %}{% if p.eta_secs %} &middot; ETA {{ p.eta_secs | eta_format }}{% endif %}{% endif -%}
           </span>
         </div>
       </div>
-      {% endif %}
       <div class="job-card-meta">
         <span class="badge encoding">Encoding…</span>
         <span>{{ job.title_count }} title{{ 's' if job.title_count != 1 else '' }}</span>
@@ -324,5 +322,81 @@ function discardAllStaged(jobId, event) {
     })
     .catch(e => alert('Network error: ' + e));
 }
+
+// ── Live progress polling (no full-page reload while nothing structural
+// changes) ────────────────────────────────────────────────────────────────
+
+let _progressBuckets = null;
+
+function _fmtEta(secs) {
+  secs = Math.floor(secs);
+  const h = Math.floor(secs / 3600);
+  const m = Math.floor((secs % 3600) / 60);
+  return h ? `${h}h ${String(m).padStart(2, '0')}m` : `${m}m`;
+}
+
+function _pollProgress() {
+  fetch('/media/progress.json')
+    .then(r => r.json())
+    .then(data => {
+      const signature = JSON.stringify(data.buckets);
+      if (_progressBuckets !== null && _progressBuckets !== signature) {
+        // Something moved between sections (rip/encode finished, a new job
+        // appeared, etc.) -- a real reload is needed to show it correctly.
+        location.reload();
+        return;
+      }
+      _progressBuckets = signature;
+
+      for (const [jobId, p] of Object.entries(data.rip || {})) {
+        const card = document.querySelector(`[data-job-id="${jobId}"]`);
+        if (!card) continue;
+        const wrap = card.querySelector('.rip-progress-wrap');
+        const fill = card.querySelector('.rip-fill');
+        const pct  = card.querySelector('.rip-pct');
+        const op   = card.querySelector('.rip-op');
+        const stale = (data.now - p.ts) > 90;
+        if (wrap) { wrap.style.display = ''; wrap.classList.toggle('rip-stale', stale); }
+        if (fill) fill.style.width = p.pct + '%';
+        if (pct)  pct.textContent = p.pct + '%';
+        if (op) {
+          op.textContent = stale
+            ? `⚠ stalled — no update for ${Math.floor((data.now - p.ts) / 60)}m`
+            : (p.op || '');
+        }
+      }
+
+      for (const [jobId, p] of Object.entries(data.encode || {})) {
+        const card = document.querySelector(`[data-job-id="${jobId}"]`);
+        if (!card) continue;
+        const wrap = card.querySelector('.enc-progress-wrap');
+        const fill = card.querySelector('.enc-fill');
+        const pct  = card.querySelector('.enc-pct');
+        const op   = card.querySelector('.rip-op');
+        if (wrap) wrap.style.display = '';
+        if (fill) fill.style.width = p.pct + '%';
+        if (pct)  pct.textContent = p.pct.toFixed(1) + '%';
+        if (op) {
+          let text = p.title || '';
+          if (p.total > 1) text += ` (${p.idx}/${p.total})`;
+          if (p.fps) text += ` · ${p.fps.toFixed(1)} fps`;
+          if (p.eta_secs) text += ` · ETA ${_fmtEta(p.eta_secs)}`;
+          op.textContent = text;
+        }
+      }
+    })
+    .catch(() => {});
+}
+
+if (document.querySelector('.job-card.ingesting, .job-card.encoding')) {
+  _pollProgress();
+  setInterval(_pollProgress, 2000);
+}
+
+// Catch up immediately when returning to a backgrounded tab, rather than
+// waiting on the next poll tick (which may itself have been throttled).
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) _pollProgress();
+});
 </script>
 {% endblock %}
