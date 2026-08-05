@@ -51,6 +51,56 @@ code {
 
 .hidden { display: none !important; }
 
+/* ─── Commit-in-progress banner ──────────────────────────────────────────────── */
+.commit-banner {
+  position: sticky;
+  top: 0;
+  z-index: 200;
+  width: 100%;
+  padding: 10px 16px;
+  background: #fdd;
+  color: #7a0000;
+  font-weight: 700;
+  font-size: 0.95rem;
+  text-align: center;
+  letter-spacing: 0.02em;
+  border-bottom: 2px solid #7a0000;
+}
+
+.makemkv-banner {
+  position: sticky;
+  top: 0;
+  z-index: 200;
+  width: 100%;
+  padding: 10px 16px;
+  background: #4a3a00;
+  color: #ffd966;
+  font-weight: 700;
+  font-size: 0.95rem;
+  text-align: center;
+  letter-spacing: 0.02em;
+  border-bottom: 2px solid #ffd966;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  gap: 12px;
+}
+
+.makemkv-banner button {
+  background: #ffd966;
+  color: #4a3a00;
+  border: none;
+  border-radius: 4px;
+  padding: 4px 12px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.makemkv-banner button:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
 /* ─── Header ────────────────────────────────────────────────────────────────── */
 .site-header {
   display: flex;
@@ -207,6 +257,13 @@ code {
 }
 .btn-remove:hover { opacity: 0.88; }
 
+.btn-retry {
+  background: var(--c-approved);
+  color: #fff;
+}
+.btn-retry:hover { opacity: 0.88; }
+.btn-retry:disabled { opacity: 0.6; cursor: default; }
+
 .btn-discard {
   background: var(--surface2);
   color: var(--c-error);
@@ -322,6 +379,15 @@ code {
 
 .job-card-name { font-weight: 600; font-size: 0.95rem; margin-bottom: 8px; }
 .job-card-meta { display: flex; align-items: center; gap: 10px; font-size: 0.82rem; color: var(--muted); margin-bottom: 4px; }
+.job-card-drive {
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  padding: 2px 7px;
+  border-radius: 4px;
+  background: rgba(245,158,11,.15);
+  color: var(--c-ingesting);
+}
 .job-card-disc { font-size: 0.78rem; color: var(--muted); margin-bottom: 4px; }
 .job-card-time { font-size: 0.78rem; color: var(--muted); }
 
@@ -489,6 +555,15 @@ code {
 .cls-badge.cls-play_all      { background: rgba(245,158,11,.15); color: var(--cls-play_all); }
 .cls-badge.cls-deleted       { background: rgba(239,68,68,.15);  color: var(--cls-deleted); }
 .cls-badge.cls-unknown       { background: rgba(107,114,128,.15); color: var(--cls-unknown); }
+
+.imdb-link {
+  display: inline-block;
+  margin-left: 8px;
+  font-size: 0.8rem;
+  color: var(--accent);
+  text-decoration: none;
+}
+.imdb-link:hover { text-decoration: underline; }
 
 /* ─── Classification buttons ─────────────────────────────────────────────────── */
 .classify-buttons {
@@ -760,6 +835,23 @@ code {
   padding: 20px;
   color: var(--muted);
   font-size: 0.9rem;
+}
+
+.last-scan-note {
+  padding: 8px 14px;
+  border-radius: 6px;
+  font-size: 0.85rem;
+  border: 1px solid transparent;
+}
+.last-scan-note.success {
+  background: rgba(34,197,94,.1);
+  border-color: rgba(34,197,94,.3);
+  color: var(--cls-tv);
+}
+.last-scan-note.error {
+  background: rgba(239,68,68,.1);
+  border-color: rgba(239,68,68,.3);
+  color: var(--cls-deleted);
 }
 
 .spin {

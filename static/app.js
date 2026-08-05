@@ -9,6 +9,13 @@ function qs(id)    { return document.getElementById(id); }
 function show(el)  { el && el.classList.remove('hidden'); }
 function hide(el)  { el && el.classList.add('hidden'); }
 
+// Commit is a synchronous file move (often across drives) with no progress
+// stream, unlike rip/encode -- this banner is the only feedback the user
+// gets while it's running. Every commit action (single-title, per-job, or
+// the all-staged-jobs button) must show/hide it.
+function showCommitBanner() { show(qs('commit-banner')); }
+function hideCommitBanner() { hide(qs('commit-banner')); }
+
 function apiPost(url, body) {
   return fetch(url, {
     method: 'POST',
@@ -75,7 +82,7 @@ function _prefillForm(container, data) {
   if (!container) return;
   const set = f => { const el = container.querySelector(`[name="${f}"]`); if (el && data[f] != null) el.value = data[f]; };
   set('show'); set('season'); set('episode'); set('episode_title');
-  set('movie_title'); set('year'); set('title');
+  set('movie_title'); set('year'); set('title'); set('imdb_id');
 
   // For specials saved before 'show' was included: derive it from the title
   // by stripping the trailing "- Special Features N" suffix.
@@ -97,11 +104,11 @@ function submitClassification(event, n) {
     const el = form.querySelector(`[name="${name}"]`);
     if (el && el.value.trim()) {
       const v = el.value.trim();
-      data[name] = isNaN(v) || name === 'show' || name === 'episode_title' || name === 'movie_title' || name === 'title'
+      data[name] = isNaN(v) || name === 'show' || name === 'episode_title' || name === 'movie_title' || name === 'title' || name === 'imdb_id'
         ? v : Number(v);
     }
   };
-  ['show','season','episode','episode_title','movie_title','year','title'].forEach(collect);
+  ['show','season','episode','episode_title','movie_title','year','title','imdb_id'].forEach(collect);
 
   apiPost(`/media/job/${JOB_ID}/title/${n}/classify`, data)
     .then(r => {
@@ -219,7 +226,10 @@ function _updateDisplay(n, cls) {
     text += ` — ${cls.title}`;
   }
 
-  display.innerHTML = `<div class="cls-badge cls-${cls.type}">${text}</div>`;
+  const imdbLink = cls.imdb_id
+    ? `<a class="imdb-link" href="https://www.imdb.com/title/${cls.imdb_id}/" target="_blank" rel="noopener">${cls.imdb_id} ↗</a>`
+    : '';
+  display.innerHTML = `<div class="cls-badge cls-${cls.type}">${text}</div>${imdbLink}`;
 
   // Mark card as classified
   const card = qs(`title-card-${n}`);
@@ -409,3 +419,49 @@ function encodeJob(jobId, event) {
     return d.innerHTML;
   }
 })();
+
+// ── MakeMKV health banner ─────────────────────────────────────────────────────
+
+(function () {
+  const banner = qs('makemkv-banner');
+  if (!banner) return;
+
+  fetch('/media/makemkv/status')
+    .then(r => r.json())
+    .then(d => {
+      if (!d.ok) {
+        qs('makemkv-banner-text').textContent = d.message || 'MakeMKV needs an update.';
+        show(banner);
+      }
+    })
+    .catch(() => {});
+})();
+
+function updateMakemkv() {
+  const btn = qs('makemkv-update-btn');
+  const text = qs('makemkv-banner-text');
+  btn.disabled = true;
+  btn.textContent = 'Updating…';
+  const prevText = text.textContent;
+  text.textContent = 'Updating MakeMKV — this can take a minute…';
+
+  apiPost('/media/makemkv/update', {})
+    .then(r => {
+      if (r.ok) {
+        text.textContent = 'MakeMKV updated successfully.';
+        btn.remove();
+        setTimeout(() => hide(qs('makemkv-banner')), 4000);
+      } else {
+        text.textContent = 'Update failed — see console for details.';
+        console.error('MakeMKV update failed:', r.output);
+        btn.disabled = false;
+        btn.textContent = 'Update MakeMKV';
+      }
+    })
+    .catch(e => {
+      text.textContent = prevText;
+      btn.disabled = false;
+      btn.textContent = 'Update MakeMKV';
+      alert('Network error: ' + e);
+    });
+}

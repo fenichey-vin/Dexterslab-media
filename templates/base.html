@@ -8,6 +8,13 @@
   {% block head %}{% endblock %}
 </head>
 <body>
+  <div id="commit-banner" class="commit-banner hidden">PLEASE WAIT — COMMIT IN PROGRESS</div>
+
+  <div id="makemkv-banner" class="makemkv-banner hidden">
+    <span id="makemkv-banner-text">MakeMKV needs an update — rips and scans will fail until updated.</span>
+    <button id="makemkv-update-btn" onclick="updateMakemkv()">Update MakeMKV</button>
+  </div>
+
   <header class="site-header">
     <a href="/media/" class="logo">
       <span class="logo-icon">◈</span>

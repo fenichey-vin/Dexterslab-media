@@ -289,7 +289,7 @@
     <!-- Staged file info + commit button -->
     {% if t.staged_path %}
     <div class="staged-path" id="staged-row-{{ t.title_num }}">
-      <strong>Staged:</strong> {{ t.staged_path | replace('/srv/media/staging/', '') }}
+      <strong>Staged:</strong> {{ t.staged_path | replace('/srv/work/staging/', '') }}
       &nbsp;
       <button class="btn-commit" onclick="commitTitle({{ t.title_num }})">
         Move to Library
@@ -320,6 +320,9 @@
             — {{ cls.title }}
           {% endif %}
         </div>
+        {% if cls.imdb_id %}
+        <a class="imdb-link" href="https://www.imdb.com/title/{{ cls.imdb_id }}/" target="_blank" rel="noopener">{{ cls.imdb_id }} ↗</a>
+        {% endif %}
       {% else %}
         <div class="cls-badge cls-unknown">Unclassified</div>
       {% endif %}
@@ -414,9 +417,15 @@
               <input type="number" name="episode" min="1" max="999" placeholder="11">
             </div>
           </div>
-          <div class="form-group">
-            <label>Episode Title <span class="optional">(optional)</span></label>
-            <input type="text" name="episode_title" placeholder="The Alternate Side">
+          <div class="form-row">
+            <div class="form-group">
+              <label>Episode Title <span class="optional">(optional)</span></label>
+              <input type="text" name="episode_title" placeholder="The Alternate Side">
+            </div>
+            <div class="form-group">
+              <label>IMDb ID <span class="optional">(optional)</span></label>
+              <input type="text" name="imdb_id" placeholder="tt0705279">
+            </div>
           </div>
         </div>
 
@@ -430,6 +439,10 @@
             <div class="form-group form-group-sm">
               <label>Year <span class="optional">(optional)</span></label>
               <input type="number" name="year" min="1888" max="2100" placeholder="1992">
+            </div>
+            <div class="form-group">
+              <label>IMDb ID <span class="optional">(optional)</span></label>
+              <input type="text" name="imdb_id" placeholder="tt0104257">
             </div>
           </div>
         </div>
@@ -627,34 +640,35 @@
   }
 
   function commitTitle(n) {
+    showCommitBanner();
     fetch(`/media/job/${JOB_ID}/title/${n}/commit`, { method: 'POST' })
       .then(r => r.json())
       .then(d => {
+        hideCommitBanner();
         if (d.ok) {
           const row = document.getElementById('staged-row-' + n);
           if (row) row.remove();
-          alert('Moved to: ' + d.dest.replace('/srv/media/', ''));
         } else {
           alert('Error: ' + (d.error || 'unknown'));
         }
       })
-      .catch(e => alert('Network error: ' + e));
+      .catch(e => { hideCommitBanner(); alert('Network error: ' + e); });
   }
 
   function commitAll(jobId) {
-    if (!confirm('Move all staged files to the Jellyfin library?')) return;
+    showCommitBanner();
     fetch(`/media/job/${jobId}/commit-all`, { method: 'POST' })
       .then(r => r.json())
       .then(d => {
+        hideCommitBanner();
         if (d.ok) {
-          const msg = `Committed ${d.committed} file(s).` + (d.errors.length ? '\nErrors:\n' + d.errors.join('\n') : '');
-          alert(msg);
+          if (d.errors.length) alert('Some titles failed to commit:\n' + d.errors.join('\n'));
           location.reload();
         } else {
           alert('Error: ' + (d.error || 'unknown'));
         }
       })
-      .catch(e => alert('Network error: ' + e));
+      .catch(e => { hideCommitBanner(); alert('Network error: ' + e); });
   }
 
   function discardTitle(n) {

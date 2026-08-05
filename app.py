@@ -27,7 +27,8 @@ from config import (REVIEW_DIR, DB_PATH, PORT, ANTHROPIC_API_KEY, ANTHROPIC_MODE
 import db
 import catalog
 import tmdb
-from disc import detect_drives, scan_disc, flag_titles, rip_title, get_duration, take_screenshots
+from disc import (detect_drives, scan_disc, flag_titles, rip_title, get_duration,
+                   take_screenshots, check_makemkv_version, _friendly_drive_label)
 
 app = Flask(__name__, static_url_path='/media/static')
 app.secret_key = 'mediaintel-change-in-production'
@@ -206,6 +207,8 @@ def fmt_reltime(iso):
 def dashboard():
     all_jobs  = db.get_all_jobs()
     active    = [j for j in all_jobs if j['status'] == 'ingesting']
+    for j in active:
+        j['friendly_drive'] = _friendly_drive_label(j['drive']) if j.get('drive') else None
     review    = [j for j in all_jobs if j['status'] == 'review']
     approved  = [j for j in all_jobs if j['status'] == 'approved']
     enc_queue = [j for j in all_jobs if j['status'] == 'queued']
@@ -439,6 +442,78 @@ def delete_job(job_id):
     return jsonify({'ok': True})
 
 
+# ── Raw review-footage cleanup ───────────────────────────────────────────────
+#
+# A completed job's raw rip (in review/) is a separate, earlier-stage copy
+# from the encoded file actually committed to the library -- commit only
+# ever moves the encoded copy out of staging/, nothing has ever cleaned up
+# the raw source once a job is done with it. This is that missing cleanup
+# step, gated on independent verification (never on commit alone) so it can
+# never delete the only good copy of something.
+
+def _job_raw_cleanup_eligible(job_id):
+    rows = db.get_catalog_rows_for_job(job_id)
+    return bool(rows) and all(r['state'] == 'verified' for r in rows)
+
+
+def _cleanup_job_raw(job_id, job=None):
+    """Delete one job's raw review-directory rip, but only once every one of
+    its catalog rows is independently verified against disk (not just
+    committed). Marks those rows 'cleaned' so this is never silently
+    re-attempted and never confused with 'still has a backing raw file'.
+    Returns bytes freed, or None if not eligible / nothing to clean.
+    """
+    job = job or db.get_job(job_id)
+    if not job or job['status'] != 'complete':
+        return None
+    if not _job_raw_cleanup_eligible(job_id):
+        return None
+    review_path = Path(job['review_path'])
+    if not review_path.exists():
+        return None
+
+    freed = sum(f.stat().st_size for f in review_path.rglob('*') if f.is_file())
+    shutil.rmtree(str(review_path))
+
+    now = datetime.now(timezone.utc).isoformat()
+    for row in db.get_catalog_rows_for_job(job_id):
+        db.update_catalog_state(row['id'], 'cleaned', cleaned_at=now)
+    return freed
+
+
+@app.route('/media/job/<job_id>/cleanup-raw', methods=['POST'])
+def cleanup_job_raw(job_id):
+    job = db.get_job(job_id)
+    if not job:
+        return jsonify({'error': 'Not found'}), 404
+    if job['status'] != 'complete':
+        return jsonify({'error': f'Job is not complete (currently: {job["status"]})'}), 400
+    if not _job_raw_cleanup_eligible(job_id):
+        return jsonify({'error': 'Not every title for this job is independently verified yet'}), 409
+    freed = _cleanup_job_raw(job_id, job)
+    if freed is None:
+        return jsonify({'error': 'Nothing to clean up (already cleaned, or raw path missing)'}), 404
+    return jsonify({'ok': True, 'freed_bytes': freed})
+
+
+@app.route('/media/cleanup-all-verified', methods=['POST'])
+def cleanup_all_verified():
+    """Bulk version of the above -- sweeps every 'complete' job and cleans
+    up any whose titles are all independently verified. Safe to run
+    repeatedly: jobs that aren't eligible yet (or already cleaned) are
+    silently skipped, not treated as errors.
+    """
+    complete = [j for j in db.get_all_jobs() if j['status'] == 'complete']
+    cleaned_ids = []
+    total_freed = 0
+    for job in complete:
+        freed = _cleanup_job_raw(job['id'], job)
+        if freed is not None:
+            cleaned_ids.append(job['id'])
+            total_freed += freed
+    return jsonify({'ok': True, 'cleaned': len(cleaned_ids), 'freed_bytes': total_freed, 'job_ids': cleaned_ids})
+
+
 # ── Encode ───────────────────────────────────────────────────────────────────
 
 @app.route('/media/encode-all', methods=['POST'])
@@ -461,6 +536,23 @@ def start_encode(job_id):
     if job['status'] != 'approved':
         return jsonify({'error': f'Job must be approved first (currently: {job["status"]})'}), 400
     db.set_job_status(job_id, 'queued')
+    _encode_queue.put(job_id)
+    return jsonify({'ok': True})
+
+
+@app.route('/media/job/<job_id>/retry-encode', methods=['POST'])
+def retry_encode(job_id):
+    """Re-queue a failed job's encode. The rip itself already succeeded --
+    only the encode write failed (most commonly seen: the work drive ran out
+    of space) -- so this just re-runs the existing encode pipeline against
+    the raw source still sitting in review/, no re-rip needed.
+    """
+    job = db.get_job(job_id)
+    if not job:
+        return jsonify({'error': 'Not found'}), 404
+    if job['status'] != 'error':
+        return jsonify({'error': f'Job is not in error status (currently: {job["status"]})'}), 400
+    db.set_job_status(job_id, 'queued', notes='')
     _encode_queue.put(job_id)
     return jsonify({'ok': True})
 
@@ -504,27 +596,28 @@ def commit_title(job_id, n):
     return jsonify({'ok': True, 'dest': str(dest)})
 
 
-@app.route('/media/job/<job_id>/commit-all', methods=['POST'])
-def commit_all(job_id):
-    titles = db.get_titles(job_id)
-    staged = [t for t in titles if t.get('staged_path')]
-    if not staged:
-        return jsonify({'error': 'No staged titles to commit'}), 400
-
+def _commit_all_titles_for_job(job_id):
+    """Commit every currently-staged title in one job. Returns (ok_list,
+    errors) -- shared by the per-job commit-all route and the
+    commit-all-staged-jobs route so there's one implementation of the
+    actual file-move logic, not two.
+    """
     ok_list = []
     errors  = []
-    for t in staged:
+    for t in db.get_titles(job_id):
+        if not t.get('staged_path'):
+            continue
         n    = t['title_num']
         path = Path(t['staged_path'])
         cls  = t.get('classification')
         if not cls or not path.exists():
-            errors.append(f'title_{n}: staged file missing or no classification')
+            errors.append(f'{job_id}/title_{n}: staged file missing or no classification')
             continue
         dest = _route_library(cls, n)
         if dest is None:
             continue
         if dest.exists():
-            errors.append(f'title_{n}: already in library ({dest.name}) — delete it first')
+            errors.append(f'{job_id}/title_{n}: already in library ({dest.name}) — delete it first')
             continue
         dest.parent.mkdir(parents=True, exist_ok=True)
         try:
@@ -533,10 +626,34 @@ def commit_all(job_id):
             db.update_title(job_id, n, staged_path=None)
             ok_list.append(str(dest))
         except OSError as e:
-            errors.append(f'title_{n}: {e}')
+            errors.append(f'{job_id}/title_{n}: {e}')
 
     _maybe_complete_staged_job(job_id)
+    return ok_list, errors
+
+
+@app.route('/media/job/<job_id>/commit-all', methods=['POST'])
+def commit_all(job_id):
+    if not any(t.get('staged_path') for t in db.get_titles(job_id)):
+        return jsonify({'error': 'No staged titles to commit'}), 400
+    ok_list, errors = _commit_all_titles_for_job(job_id)
     return jsonify({'ok': True, 'committed': len(ok_list), 'errors': errors})
+
+
+@app.route('/media/commit-all-staged', methods=['POST'])
+def commit_all_staged():
+    """Commit every staged title across every 'staged' job in one action --
+    backs the dashboard's top-level "Commit All Staged" button. Reuses the
+    exact same per-job commit logic as the individual per-job button.
+    """
+    staged_jobs = [j for j in db.get_all_jobs() if j['status'] == 'staged']
+    total_committed = 0
+    all_errors = []
+    for job in staged_jobs:
+        ok_list, errors = _commit_all_titles_for_job(job['id'])
+        total_committed += len(ok_list)
+        all_errors.extend(errors)
+    return jsonify({'ok': True, 'committed': total_committed, 'errors': all_errors, 'jobs': len(staged_jobs)})
 
 
 def _catalog_commit(job_id, n, title, cls, dest):
@@ -1311,10 +1428,95 @@ def _rip_disc_bg(job_id, device, title_nums, disc_context):
 
 # ── New Rip page ──────────────────────────────────────────────────────────────
 
+# ── MakeMKV health check ─────────────────────────────────────────────────────
+
+_makemkv_status_cache = {'checked_at': 0, 'ok': True, 'message': ''}
+_MAKEMKV_STATUS_TTL = 120  # seconds -- avoid spawning makemkvcon on every page load
+
+
+@app.route('/media/makemkv/status')
+def makemkv_status():
+    now = time.time()
+    if now - _makemkv_status_cache['checked_at'] > _MAKEMKV_STATUS_TTL:
+        ok, message = check_makemkv_version()
+        _makemkv_status_cache.update(checked_at=now, ok=ok, message=message)
+    return jsonify({'ok': _makemkv_status_cache['ok'], 'message': _makemkv_status_cache['message']})
+
+
+@app.route('/media/makemkv/update', methods=['POST'])
+def makemkv_update():
+    try:
+        result = subprocess.run(
+            ['sudo', '-n', '/usr/local/sbin/mediaintel-update-makemkv'],
+            capture_output=True, text=True, timeout=180
+        )
+    except subprocess.TimeoutExpired:
+        return jsonify({'ok': False, 'output': 'Update timed out after 3 minutes.'}), 500
+
+    output = (result.stdout or '') + (result.stderr or '')
+    if result.returncode != 0:
+        return jsonify({'ok': False, 'output': output}), 500
+
+    # Force a fresh check next time status is polled instead of waiting out the TTL
+    _makemkv_status_cache.update(checked_at=0)
+    return jsonify({'ok': True, 'output': output})
+
+
 @app.route('/media/rip')
 def rip_page():
     drives = detect_drives()
+    # Flag a drive as busy if an active rip job is using it, so the New Disc
+    # Rip page can warn against starting a second job on the same drive
+    # instead of just showing "disc detected" with no hint it's mid-rip.
+    active_by_drive = {j['drive']: j for j in db.get_all_jobs()
+                       if j['status'] == 'ingesting' and j.get('drive')}
+    for d in drives:
+        busy_job = active_by_drive.get(d['device'])
+        d['busy_job'] = busy_job['name'] if busy_job else None
     return render_template('rip.html', drives=drives)
+
+
+# ── Disc scan (background thread + polled status) ────────────────────────────
+#
+# A scan is a slow (up to SCAN_TIMEOUT seconds) makemkvcon call. Running it
+# inline in the request handler meant navigating away lost the result
+# entirely (the server kept scanning with nobody listening) and a second
+# click on the same drive spawned a second, overlapping makemkvcon process
+# with nothing preventing it. Tracking state here per-device instead means
+# the rip page can poll and recover its result even after a navigation, and
+# a second scan request for a drive already scanning is rejected outright.
+
+_scan_state = {}       # device -> {'status': 'running'|'done'|'error', ...}
+_scan_lock  = threading.Lock()
+
+
+def _dur_str(secs):
+    if not secs:
+        return '?:??:??'
+    secs = int(secs)
+    h, rem = divmod(secs, 3600)
+    m, s   = divmod(rem, 60)
+    return f'{h}:{m:02d}:{s:02d}'
+
+
+def _scan_disc_bg(device):
+    try:
+        titles, disc_label = scan_disc(device)
+        titles = flag_titles(titles)
+        for t in titles:
+            t['dur_str'] = _dur_str(t['dur_secs'])
+
+        disc_id = None
+        if ANTHROPIC_API_KEY:
+            disc_id = _identify_disc_with_claude(disc_label, titles)
+
+        _scan_state[device] = {
+            'status': 'done',
+            'finished_at': time.time(),
+            'result': {'disc_label': disc_label, 'titles': titles, 'disc_id': disc_id},
+        }
+    except Exception as e:
+        _scan_state[device] = {'status': 'error', 'finished_at': time.time(), 'message': str(e)}
 
 
 @app.route('/media/rip/scan', methods=['POST'])
@@ -1324,30 +1526,20 @@ def rip_scan_ajax():
     if not device:
         return jsonify({'error': 'No device specified'}), 400
 
-    try:
-        titles, disc_label = scan_disc(device)
-    except Exception as e:
-        return jsonify({'error': f'Scan failed: {e}'}), 500
+    with _scan_lock:
+        if _scan_state.get(device, {}).get('status') == 'running':
+            return jsonify({'error': 'A scan is already in progress for this drive', 'busy': True}), 409
+        _scan_state[device] = {'status': 'running', 'started_at': time.time()}
 
-    titles = flag_titles(titles)
+    threading.Thread(target=_scan_disc_bg, args=(device,), daemon=True).start()
+    return jsonify({'ok': True})
 
-    # Add human-readable dur_str to each title
-    def _dur(secs):
-        if not secs:
-            return '?:??:??'
-        secs = int(secs)
-        h, rem = divmod(secs, 3600)
-        m, s   = divmod(rem, 60)
-        return f'{h}:{m:02d}:{s:02d}'
 
-    for t in titles:
-        t['dur_str'] = _dur(t['dur_secs'])
-
-    disc_id = None
-    if ANTHROPIC_API_KEY:
-        disc_id = _identify_disc_with_claude(disc_label, titles)
-
-    return jsonify({'disc_label': disc_label, 'titles': titles, 'disc_id': disc_id})
+@app.route('/media/rip/scan-status')
+def rip_scan_status():
+    device = request.args.get('device', '')
+    state  = _scan_state.get(device, {'status': 'idle'})
+    return jsonify(state)
 
 
 @app.route('/media/rip/start', methods=['POST'])
@@ -1370,7 +1562,8 @@ def rip_start_ajax():
     job_dir   = REVIEW_DIR / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
 
-    db.create_job(job_id, job_name, job_dir, disc_context=disc_context)
+    db.create_job(job_id, job_name, job_dir, drive=device, disc_context=disc_context)
+    _scan_state.pop(device, None)  # stale scan result for this device no longer applies
 
     t = threading.Thread(
         target=_rip_disc_bg,
@@ -1612,6 +1805,16 @@ def catalog_status():
                            failed_rows=failed_rows,
                            conflicts=conflict_data['conflicts'],
                            unroutable=conflict_data['unroutable'])
+
+
+@app.route('/media/catalog/verify-pending', methods=['POST'])
+def catalog_verify_pending():
+    """Bulk-run catalog.verify_pending_rows() -- checks every row still in
+    'pending' or 'committed' against disk (read-only: stat + ffprobe only)
+    and promotes each to 'verified' or 'failed'. Idempotent.
+    """
+    summary = catalog.verify_pending_rows()
+    return jsonify({'ok': True, **summary})
 
 
 @app.route('/media/catalog/<int:catalog_id>')

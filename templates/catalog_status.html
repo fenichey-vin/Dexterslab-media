@@ -21,6 +21,21 @@
   {% endfor %}
 </div>
 
+<div style="display:flex;gap:12px;margin-top:16px;flex-wrap:wrap">
+  <button class="btn btn-primary" onclick="verifyPending(this)">
+    ↺ Reverify All Pending/Committed ({{ counts.get('pending', 0) + counts.get('committed', 0) }})
+  </button>
+  <button class="btn btn-primary" onclick="cleanupAllVerified(this)">
+    🧹 Clean Up Raw Footage for Verified Jobs
+  </button>
+</div>
+<p style="color:var(--muted);font-size:0.82rem;margin-top:8px;max-width:640px">
+  Reverify checks pending/committed rows against disk (read-only) and promotes them to verified/failed.
+  Clean Up deletes the original raw rip in <code>review/</code> for jobs whose every title is independently
+  verified — the encoded copy already lives safely in the library, so this only ever removes a redundant,
+  already-confirmed-safe extra copy. Never touches anything still pending, committed-but-unverified, or failed.
+</p>
+
 <h2 class="section-title" style="margin-top:24px">Source breakdown</h2>
 <div class="stat-grid">
   {% for source, n in source_counts.items() %}
@@ -133,6 +148,36 @@
 
 {% block extra_js %}
 <script>
+function verifyPending(btn) {
+  btn.disabled = true;
+  const original = btn.textContent;
+  btn.textContent = 'Checking…';
+  fetch('/media/catalog/verify-pending', { method: 'POST' })
+    .then(r => r.json())
+    .then(d => {
+      if (d.error) { alert('Error: ' + d.error); btn.disabled = false; btn.textContent = original; return; }
+      alert(`Checked ${d.checked} — ${d.verified} verified, ${d.missing} missing, ${d.failed} failed for other reasons.`);
+      location.reload();
+    })
+    .catch(e => { alert('Network error: ' + e); btn.disabled = false; btn.textContent = original; });
+}
+
+function cleanupAllVerified(btn) {
+  if (!confirm('Delete the raw review-directory rip for every job whose titles are all independently verified? The encoded copy already in the library is untouched.')) return;
+  btn.disabled = true;
+  const original = btn.textContent;
+  btn.textContent = 'Cleaning up…';
+  fetch('/media/cleanup-all-verified', { method: 'POST' })
+    .then(r => r.json())
+    .then(d => {
+      if (d.error) { alert('Error: ' + d.error); btn.disabled = false; btn.textContent = original; return; }
+      const gb = (d.freed_bytes / (1024**3)).toFixed(1);
+      alert(`Cleaned up ${d.cleaned} job(s), freed ${gb} GB.`);
+      location.reload();
+    })
+    .catch(e => { alert('Network error: ' + e); btn.disabled = false; btn.textContent = original; });
+}
+
 function reverifyRow(catalogId, btn) {
   btn.disabled = true;
   const original = btn.textContent;

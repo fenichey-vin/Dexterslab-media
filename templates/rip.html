@@ -19,8 +19,10 @@
     </div>
     {% elif drives|length == 1 %}
     <p style="color:var(--muted);font-size:0.9rem;margin-bottom:12px">
-      Drive: <strong style="color:var(--text)">{{ drives[0].device }}</strong>
-      {% if drives[0].has_media %}
+      Drive: <strong style="color:var(--text)">{{ drives[0].label }}</strong>
+      {% if drives[0].busy_job %}
+        <span style="color:var(--c-ingesting);font-size:0.8rem;margin-left:8px">● busy — ripping "{{ drives[0].busy_job }}"</span>
+      {% elif drives[0].has_media %}
         <span style="color:var(--accent);font-size:0.8rem;margin-left:8px">● disc detected</span>
       {% else %}
         <span style="color:var(--muted);font-size:0.8rem;margin-left:8px">○ no disc</span>
@@ -37,11 +39,15 @@
                    border-radius:6px;padding:8px 12px;color:var(--text);
                    font-size:0.9rem;outline:none;width:100%;max-width:320px">
       {% for d in drives %}
-      <option value="{{ d.device }}">{{ d.device }}{% if d.has_media %} — disc detected{% else %} — empty{% endif %}</option>
+      <option value="{{ d.device }}">{{ d.label }}{% if d.busy_job %} — busy: ripping "{{ d.busy_job }}"{% elif d.has_media %} — disc detected{% else %} — empty{% endif %}</option>
       {% endfor %}
     </select>
     {% endif %}
   </div>
+
+  <!-- Prominent warning if the currently-selected drive is mid-rip -- easy to
+       miss buried in a collapsed dropdown option otherwise. -->
+  <div id="drive-busy-warning" class="notice ingesting hidden" style="margin-bottom:16px"></div>
 
   <!-- Scan button -->
   {% if drives|length > 0 %}
@@ -55,6 +61,14 @@
     <span class="spin">◌</span>
     <span id="scan-loading-msg">Scanning disc… this takes about 30–60 seconds</span>
   </div>
+
+  <!-- Quiet, persistent note on the selected drive's last scan outcome -- shown
+       regardless of how we found out (page load, drive switch, or a fresh
+       click), unlike the blocking alert() which only fires for a fresh click.
+       This exists specifically so a scan that fails while the tab is
+       backgrounded/reloaded still leaves a visible trace instead of silently
+       reverting to the idle screen with no indication anything happened. -->
+  <div id="last-scan-note" class="last-scan-note hidden" style="margin-bottom:16px"></div>
 
   <!-- Results panel -->
   <div id="results-panel" class="hidden">
@@ -230,12 +244,31 @@
 'use strict';
 
 let _discTitles      = [];
-let _scanTimer       = null;
 let _jobNameEdited   = false;
+
+// device -> busy job name (or null), computed server-side so this stays in
+// sync with whatever detect_drives()/rip_page() actually found.
+const DRIVE_BUSY = {
+  {%- for d in drives %}
+  {{ d.device | tojson }}: {{ d.busy_job | tojson }}{{ "," if not loop.last }}
+  {%- endfor %}
+};
 
 function _getDrive() {
   const el = document.getElementById('drive-select');
   return el ? el.value : '';
+}
+
+function _updateDriveBusyWarning() {
+  const warning = document.getElementById('drive-busy-warning');
+  if (!warning) return;
+  const busyJob = DRIVE_BUSY[_getDrive()];
+  if (busyJob) {
+    warning.textContent = `⚠ This drive is currently ripping "${busyJob}" — starting a new scan/rip here will conflict with it.`;
+    warning.classList.remove('hidden');
+  } else {
+    warning.classList.add('hidden');
+  }
 }
 
 // ── Disc context helpers ─────────────────────────────────────────────────────
@@ -313,20 +346,71 @@ function _prefillContextFromScan(discId) {
 }
 
 // ── Scan ─────────────────────────────────────────────────────────────────────
+//
+// Scanning runs server-side in a background thread (see /media/rip/scan-status)
+// specifically so this page can recover its state after a navigation -- if you
+// switch drives or leave and come back mid-scan, the poll loop below picks the
+// scan back up instead of losing the result or letting you double-launch a
+// second makemkvcon against the same drive.
+
+let _scanPollTimer = null;
+
+function _setScanBusy(startedAt) {
+  document.getElementById('scan-btn').disabled = true;
+  document.getElementById('scan-loading').classList.remove('hidden');
+  document.getElementById('scan-loading-msg').textContent =
+    startedAt && (Date.now() / 1000 - startedAt) > 25
+      ? 'Still scanning… can take a few minutes if the drive needs a retry'
+      : 'Scanning disc… this takes about 30–60 seconds';
+}
+
+function _setScanIdle() {
+  document.getElementById('scan-btn').disabled = false;
+  document.getElementById('scan-loading').classList.add('hidden');
+}
+
+function _hideLastScanNote() {
+  const note = document.getElementById('last-scan-note');
+  if (note) { note.classList.add('hidden'); note.textContent = ''; }
+}
+
+function _updateLastScanNote(state) {
+  const note = document.getElementById('last-scan-note');
+  if (!note) return;
+  const when = state.finished_at
+    ? new Date(state.finished_at * 1000).toLocaleTimeString()
+    : '';
+  if (state.status === 'done') {
+    const label = (state.result && state.result.disc_label) || 'disc';
+    note.textContent = `Last scan (${when}): succeeded -- ${label}`;
+    note.className = 'last-scan-note success';
+  } else if (state.status === 'error') {
+    note.textContent = `Last scan (${when}): failed -- ${state.message}`;
+    note.className = 'last-scan-note error';
+  } else {
+    _hideLastScanNote();
+    return;
+  }
+  note.classList.remove('hidden');
+}
+
+function _renderScanResult(result) {
+  _discTitles = result.titles || [];
+  document.getElementById('disc-label-display').textContent = result.disc_label || '';
+  _prefillContextFromScan(result.disc_id || null);
+  _buildTitlesTable(_discTitles);
+  document.getElementById('results-panel').classList.remove('hidden');
+  updateRipCount();
+}
 
 function scanDisc() {
   const drive = _getDrive();
   if (!drive) { alert('No drive available.'); return; }
 
   _jobNameEdited = false;
-  document.getElementById('scan-btn').disabled = true;
-  document.getElementById('scan-loading').classList.remove('hidden');
   document.getElementById('results-panel').classList.add('hidden');
-
-  _scanTimer = setTimeout(() => {
-    const msg = document.getElementById('scan-loading-msg');
-    if (msg) msg.textContent = 'Still scanning… MakeMKV can take up to 2 minutes on some discs';
-  }, 30000);
+  _hideLastScanNote();
+  _setScanBusy(Date.now() / 1000);
 
   fetch('/media/rip/scan', {
     method: 'POST',
@@ -335,30 +419,107 @@ function scanDisc() {
   })
   .then(r => r.json())
   .then(data => {
-    clearTimeout(_scanTimer);
-    document.getElementById('scan-loading').classList.add('hidden');
-    document.getElementById('scan-btn').disabled = false;
-
-    if (data.error) { alert('Scan error: ' + data.error); return; }
-
-    _discTitles = data.titles || [];
-
-    document.getElementById('disc-label-display').textContent = data.disc_label || '';
-
-    // Pre-fill context fields from Claude disc ID; user can correct before ripping
-    _prefillContextFromScan(data.disc_id || null);
-
-    _buildTitlesTable(_discTitles);
-    document.getElementById('results-panel').classList.remove('hidden');
-    updateRipCount();
+    if (data.error && !data.busy) {
+      _setScanIdle();
+      alert('Scan error: ' + data.error);
+      return;
+    }
+    // Either just started, or already running from an earlier click/navigation --
+    // either way, start (or resume) polling for its result. This follows a
+    // fresh POST the user just made, so any result we see -- including an
+    // error -- is genuinely about THIS attempt.
+    _pollScanStatus(drive, 'active');
   })
   .catch(e => {
-    clearTimeout(_scanTimer);
-    document.getElementById('scan-loading').classList.add('hidden');
-    document.getElementById('scan-btn').disabled = false;
+    _setScanIdle();
     alert('Network error during scan: ' + e);
   });
 }
+
+// mode is one of:
+//   'passive' -- fresh page load. An old finished done/error result here is
+//     stale history from before the page even opened and must never be
+//     replayed as if it just happened (this was a real bug: reloading the
+//     rip page re-alerted an old timeout from an unrelated earlier attempt).
+//     Only a still-running scan gets resumed.
+//   'switch'  -- the user deliberately switched the drive dropdown mid-session
+//     (e.g. checking on drive A while drive B scans). A finished 'done' result
+//     is worth showing -- that's genuinely useful. But an 'error' must stay
+//     quiet: the physical disc in that drive may have changed since the error
+//     happened (swap out a bad disc, put in a new one), and popping the OLD
+//     error the moment you select that drive again looks exactly like the
+//     app refusing to scan the NEW disc, when nothing has actually blocked it.
+//   'active'  -- this poll chain descends from the user's own explicit Scan
+//     Disc click (or a scan we found already running because of one). Any
+//     outcome, including error, is about that fresh attempt and must be shown.
+// Once a scan is confirmed genuinely running, every later transition we
+// observe is happening in real time, so subsequent polls always continue as
+// 'active' regardless of how this chain started.
+function _pollScanStatus(drive, mode) {
+  clearTimeout(_scanPollTimer);
+
+  fetch(`/media/rip/scan-status?device=${encodeURIComponent(drive)}`)
+    .then(r => r.json())
+    .then(state => {
+      if (_getDrive() !== drive) return;  // user switched drives mid-poll -- drop this result
+
+      if (state.status === 'running') {
+        _setScanBusy(state.started_at);
+        _hideLastScanNote();
+        _scanPollTimer = setTimeout(() => _pollScanStatus(drive, 'active'), 2000);
+        return;
+      }
+
+      _setScanIdle();
+
+      // Always leave a quiet, visible trace of the outcome -- even a passive
+      // check shows this, so a scan that fails while the tab is backgrounded
+      // or gets reloaded by the browser doesn't vanish with zero indication
+      // anything happened (the actual bug report this addresses).
+      if (state.status === 'done' || state.status === 'error') {
+        _updateLastScanNote(state);
+      } else {
+        _hideLastScanNote();
+      }
+
+      if (mode === 'passive') return;  // never auto-render results or alert on a passive check
+
+      if (state.status === 'done') {
+        _renderScanResult(state.result);
+      } else if (state.status === 'error' && mode === 'active') {
+        alert('Scan error: ' + state.message);
+      }
+      // mode === 'switch' + error: the quiet note above already covers it, no alert.
+    })
+    .catch(() => { _scanPollTimer = setTimeout(() => _pollScanStatus(drive, mode), 3000); });
+}
+
+// Only for the very first check on a fresh page load -- passive, so an old
+// finished result sitting from before this page even opened never gets
+// replayed as if it just happened (the page-refresh bug).
+function _checkScanStatusOnLoad() {
+  const drive = _getDrive();
+  clearTimeout(_scanPollTimer);
+  _updateDriveBusyWarning();
+  if (!drive) return;
+  document.getElementById('results-panel').classList.add('hidden');
+  _pollScanStatus(drive, 'passive');
+}
+
+// Deliberately switching the drive dropdown, mid-session, is you asking to
+// see THAT drive's current state right now -- e.g. ripping two discs at once,
+// switching to drive B to start it, then switching back to check on drive A.
+function _onDriveSwitch() {
+  const drive = _getDrive();
+  clearTimeout(_scanPollTimer);
+  _updateDriveBusyWarning();
+  if (!drive) return;
+  document.getElementById('results-panel').classList.add('hidden');
+  _pollScanStatus(drive, 'switch');
+}
+
+document.getElementById('drive-select')?.addEventListener('change', _onDriveSwitch);
+_checkScanStatusOnLoad();
 
 function _buildTitlesTable(titles) {
   const tbody = document.getElementById('titles-tbody');

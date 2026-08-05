@@ -54,6 +54,7 @@
       </div>
       <div class="job-card-meta">
         <span class="badge ingesting">Ripping…</span>
+        {% if job.friendly_drive %}<span class="job-card-drive">{{ job.friendly_drive }}</span>{% endif %}
         <span>{{ job.title_count }} title{{ 's' if job.title_count != 1 else '' }} done</span>
       </div>
       <div class="job-card-time">{{ job.created_at | reltime }}</div>
@@ -186,9 +187,9 @@
 
 {% if staged %}
 <section class="job-section">
-  <h2 class="section-title">
-    <span class="status-dot staged"></span>
-    Staged — Watch &amp; Commit ({{ staged|length }})
+  <h2 class="section-title" style="display:flex;align-items:center;justify-content:space-between">
+    <span><span class="status-dot staged"></span>Staged — Watch &amp; Commit ({{ staged|length }})</span>
+    <button class="btn btn-commit" onclick="commitAllStaged(event)" style="font-size:0.8rem;padding:4px 12px">✓ Commit All Staged</button>
   </h2>
   <div class="job-grid">
     {% for job in staged %}
@@ -244,17 +245,20 @@
   </h2>
   <div class="job-grid">
     {% for job in failed %}
-    <a href="/media/job/{{ job.id }}" class="job-card {{ job.status }}">
-      <div class="job-card-name">{{ job.name }}</div>
-      <div class="job-card-meta">
-        <span class="badge {{ job.status }}">{{ job.status | capitalize }}</span>
-        <span>{{ job.title_count }} title{{ 's' if job.title_count != 1 else '' }}</span>
-      </div>
-      {% if job.notes %}
-      <div class="job-card-disc">{{ job.notes }}</div>
-      {% endif %}
-      <div class="job-card-time">{{ job.created_at | reltime }}</div>
-    </a>
+    <div class="job-card {{ job.status }} job-card-with-action">
+      <a href="/media/job/{{ job.id }}" class="job-card-inner">
+        <div class="job-card-name">{{ job.name }}</div>
+        <div class="job-card-meta">
+          <span class="badge {{ job.status }}">{{ job.status | capitalize }}</span>
+          <span>{{ job.title_count }} title{{ 's' if job.title_count != 1 else '' }}</span>
+        </div>
+        {% if job.notes %}
+        <div class="job-card-disc">{{ job.notes }}</div>
+        {% endif %}
+        <div class="job-card-time">{{ job.created_at | reltime }}</div>
+      </a>
+      <button class="btn btn-retry" onclick="retryEncode('{{ job.id }}', event, this)">↻ Retry Encode</button>
+    </div>
     {% endfor %}
   </div>
 </section>
@@ -280,6 +284,27 @@ function removeJob(jobId, event) {
     .catch(e => alert('Network error: ' + e));
 }
 
+function retryEncode(jobId, event, btn) {
+  if (event) { event.preventDefault(); event.stopPropagation(); }
+  btn.disabled = true;
+  btn.textContent = 'Queuing…';
+  fetch(`/media/job/${jobId}/retry-encode`, { method: 'POST' })
+    .then(r => r.json())
+    .then(d => {
+      if (d.ok) { location.reload(); }
+      else {
+        alert('Error: ' + (d.error || 'unknown'));
+        btn.disabled = false;
+        btn.textContent = '↻ Retry Encode';
+      }
+    })
+    .catch(e => {
+      alert('Network error: ' + e);
+      btn.disabled = false;
+      btn.textContent = '↻ Retry Encode';
+    });
+}
+
 function encodeAll(event) {
   if (event) { event.preventDefault(); event.stopPropagation(); }
   if (!confirm('Queue all {{ approved|length }} approved job(s) for encoding?')) return;
@@ -291,19 +316,36 @@ function encodeAll(event) {
 
 function commitAll(jobId, event) {
   if (event) { event.preventDefault(); event.stopPropagation(); }
-  if (!confirm('Move all staged files to the Jellyfin library?')) return;
+  showCommitBanner();
   fetch(`/media/job/${jobId}/commit-all`, { method: 'POST' })
     .then(r => r.json())
     .then(d => {
+      hideCommitBanner();
       if (d.ok) {
-        const msg = `Committed ${d.committed} file(s).` + (d.errors.length ? '\nErrors:\n' + d.errors.join('\n') : '');
-        alert(msg);
+        if (d.errors.length) alert('Some titles failed to commit:\n' + d.errors.join('\n'));
         location.reload();
       } else {
         alert('Error: ' + (d.error || 'unknown'));
       }
     })
-    .catch(e => alert('Network error: ' + e));
+    .catch(e => { hideCommitBanner(); alert('Network error: ' + e); });
+}
+
+function commitAllStaged(event) {
+  if (event) { event.preventDefault(); event.stopPropagation(); }
+  showCommitBanner();
+  fetch('/media/commit-all-staged', { method: 'POST' })
+    .then(r => r.json())
+    .then(d => {
+      hideCommitBanner();
+      if (d.ok) {
+        if (d.errors.length) alert('Some titles failed to commit:\n' + d.errors.join('\n'));
+        location.reload();
+      } else {
+        alert('Error: ' + (d.error || 'unknown'));
+      }
+    })
+    .catch(e => { hideCommitBanner(); alert('Network error: ' + e); });
 }
 
 function discardAllStaged(jobId, event) {

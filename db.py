@@ -448,6 +448,12 @@ def get_catalog_row(job_id, title_num):
         return dict(row) if row else None
 
 
+def get_catalog_rows_for_job(job_id):
+    with _db() as conn:
+        rows = conn.execute('SELECT * FROM catalog WHERE job_id=?', (job_id,)).fetchall()
+        return [dict(r) for r in rows]
+
+
 def get_catalog_rows_by_state(states):
     """states: list of state strings, e.g. ['pending', 'committed']."""
     placeholders = ','.join('?' for _ in states)
