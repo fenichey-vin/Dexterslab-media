@@ -90,9 +90,21 @@
           Disc Content — Confirm Before Ripping
         </div>
         <p style="font-size:0.82rem;color:var(--muted);margin:0 0 12px">
-          For TV, this is used to look up each episode's real title (season/episode number, not
-          guessed). For movies, Claude confirms the main feature from screenshots. Correct it if
-          auto-detection is wrong.
+          Type this in while the disc is still in your hand — season and episode numbers are
+          never guessed by the app. For TV, this is used to look up each episode's real title
+          (season/episode number you enter, not inferred from disc order or duration). For
+          movies, Claude confirms the main feature from screenshots after ripping.
+        </p>
+        <p id="ctx-carryover-note" class="hidden"
+           style="font-size:0.8rem;color:var(--accent);margin:0 0 12px">
+          ℹ Show name carried over from your last TV rip — season and episodes are always
+          left blank. Double-check the show name too if this is a different series.
+        </p>
+        <p id="ctx-disclabel-note" class="hidden"
+           style="font-size:0.8rem;color:#e8c874;margin:0 0 12px">
+          ⚠ <span id="ctx-disclabel-text"></span> — VERIFY against the sleeve before ripping.
+          This assumes every disc in the set has the same episode count, which isn't always true
+          (the last disc in a season is often shorter).
         </p>
 
         <!-- Type selector -->
@@ -328,14 +340,38 @@ function _buildDiscContext() {
 }
 
 function _prefillContextFromScan(discId) {
+  const note     = document.getElementById('ctx-carryover-note');
+  const dlNote   = document.getElementById('ctx-disclabel-note');
+  const dlText   = document.getElementById('ctx-disclabel-text');
+  if (note)   note.classList.add('hidden');
+  if (dlNote) dlNote.classList.add('hidden');
   if (!discId) return;
+
   if (discId.type === 'tv') {
     document.getElementById('ctx-type-tv').checked = true;
     onCtxTypeChange();
-    if (discId.show)    document.getElementById('ctx-show').value   = discId.show;
-    if (discId.season)  document.getElementById('ctx-season').value = discId.season;
-    if ((discId.episodes || []).length)
-      document.getElementById('ctx-episodes').value = discId.episodes.join(', ');
+    if (discId.show) document.getElementById('ctx-show').value = discId.show;
+
+    if (discId._source === 'disc_label_pattern') {
+      // Real signal: the disc's own volume label carried a literal disc
+      // number, combined with the operator's own established per-disc
+      // episode count from prior rips of this show. Pre-filled but flagged
+      // loudly as a suggestion to verify -- never season/episode from
+      // duration or disc-position guessing.
+      if (discId.season) document.getElementById('ctx-season').value = discId.season;
+      if ((discId.episodes || []).length)
+        document.getElementById('ctx-episodes').value = discId.episodes.join(', ');
+      if (dlNote && dlText) {
+        dlText.textContent = `Suggested Season ${discId.season || '?'}, ` +
+          `Episodes ${discId.episodes[0]}-${discId.episodes[discId.episodes.length - 1]} ` +
+          `(from disc #${discId._disc_num} × ${discId._per_disc} episodes/disc, based on your prior rips)`;
+        dlNote.classList.remove('hidden');
+      }
+    } else if (discId.show && note) {
+      // Show name only -- season/episodes deliberately left blank, never
+      // carried over or guessed.
+      note.classList.remove('hidden');
+    }
   } else if (discId.type === 'movie') {
     document.getElementById('ctx-type-movie').checked = true;
     onCtxTypeChange();
@@ -611,6 +647,29 @@ function updateRipCount() {
 function startRip() {
   const jobName = (document.getElementById('job-name').value || '').trim();
   if (!jobName) { alert('Please enter a job name.'); return; }
+
+  // For TV, require Show + Season + Episodes typed in BEFORE ripping starts,
+  // while the disc is still in your hand and you can read the sleeve. This
+  // is the whole point of the disc context panel -- classification later
+  // (screenshot guessing, disc-position assumptions) is much weaker than
+  // "the operator read it off the case a moment ago". Skipping this is what
+  // produced wrong episode numbers before.
+  const ctxType = document.querySelector('input[name="ctx-type"]:checked')?.value;
+  if (ctxType === 'tv') {
+    const show     = (document.getElementById('ctx-show').value || '').trim();
+    const season   = (document.getElementById('ctx-season').value || '').trim();
+    const episodes = (document.getElementById('ctx-episodes').value || '').trim();
+    const missing = [];
+    if (!show) missing.push('Show Name');
+    if (!season) missing.push('Season');
+    if (!episodes) missing.push('Episodes on disc');
+    if (missing.length) {
+      alert('Before ripping a TV disc, fill in: ' + missing.join(', ') +
+            '.\n\nThis is your only chance to enter it while the disc case is in hand -- ' +
+            'do it now rather than guessing later from screenshots.');
+      return;
+    }
+  }
 
   const titleNums = [...document.querySelectorAll('.title-check')]
     .filter(c => c.checked)

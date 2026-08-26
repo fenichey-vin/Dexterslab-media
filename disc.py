@@ -114,7 +114,18 @@ def check_makemkv_version():
     return True, ''
 
 
-SCAN_IDLE_TIMEOUT = 45    # seconds of ZERO new output before we consider it truly stuck
+SCAN_IDLE_TIMEOUT = 90    # seconds of ZERO new output before we consider it truly stuck.
+                          # Was 45s; measured directly (2026-08-25) that the LOWER OPT
+                          # drive (ATAPI iHAS124) goes fully silent for 50-60+s between
+                          # "Using direct disc access mode" and the first "Title #N was
+                          # added" line while it reads a disc's structure -- this is
+                          # normal healthy read time on this drive/disc pairing, not a
+                          # stall, and 45s was killing genuinely-working scans mid-read
+                          # (confirmed: the exact same command succeeded standalone
+                          # immediately after the app declared it "stuck" and gave up
+                          # after 4 attempts / ~4 minutes). 90s gives real margin above
+                          # the observed worst case while still catching a truly dead
+                          # process reasonably fast.
 SCAN_MAX_TIMEOUT  = 600   # seconds -- hard backstop even if it's still actively producing output
 SCAN_RETRY_DELAY  = 15    # seconds -- a scan launched right after insert can wedge on a drive that
                           # hasn't finished spinning up/settling yet, even on a perfectly healthy
@@ -349,10 +360,17 @@ def flag_titles(titles):
         if d == 0:
             flags.append('no_duration')
 
-        # Near-duplicate duration
+        # Near-duplicate duration: TV episodes in the same season are
+        # ALWAYS within a minute or two of each other by design (see
+        # media-library-integrity skill -- "duration is not an identifier").
+        # A 30s window flagged basically every title on every TV disc as
+        # "possible_duplicate", which is noise, not signal. Tightened to 3s:
+        # that only catches discs where a title was genuinely re-encoded/
+        # duplicated (near-frame-identical runtime), not "these are both
+        # roughly 44-minute episodes".
         dupes = sum(
             1 for t2 in titles
-            if t2['num'] != t['num'] and abs(t2['dur_secs'] - d) < 30
+            if t2['num'] != t['num'] and abs(t2['dur_secs'] - d) < 3
         )
         if dupes:
             flags.append('possible_duplicate')

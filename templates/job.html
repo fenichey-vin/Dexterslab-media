@@ -41,6 +41,22 @@
   </div>
 </div>
 
+{% if show_verify_nudge %}
+<div style="background:#3a2e10;border:1px solid #7a5c1e;border-radius:8px;
+            padding:12px 16px;margin-bottom:20px;display:flex;justify-content:space-between;
+            align-items:center;gap:12px;flex-wrap:wrap">
+  <div style="font-size:0.88rem;color:#e8c874">
+    ⚠ Every title is classified, but none has been through <strong>Verify via Transcript</strong> yet.
+    Disc position / TMDb lookup can still be wrong on scrambled or misordered discs —
+    a quick dialogue check before you Approve &amp; Encode catches that.
+  </div>
+  <button class="btn" onclick="document.getElementById('verify-transcript-btn')?.scrollIntoView({behavior:'smooth',block:'center'})"
+          style="white-space:nowrap;flex-shrink:0">
+    Go to Verify via Transcript ↓
+  </button>
+</div>
+{% endif %}
+
 <!-- Progress bar -->
 {% if total_count > 0 %}
 <div class="progress-bar-wrap">
@@ -237,6 +253,11 @@
               style="white-space:nowrap">
         {% if job.disc_context and job.disc_context.type == 'tv' %}Look Up All Episodes{% else %}Classify All with Claude{% endif %}
       </button>
+      <button class="btn" id="verify-transcript-btn" onclick="verifyTranscript()"
+              style="white-space:nowrap;display:{% if job.disc_context and job.disc_context.type == 'tv' %}block{% else %}none{% endif %}"
+              title="Sample dialogue from each title and match it against the real episode scripts — catches wrong episode numbers/titles that disc-position or screenshot guessing can miss.">
+        🎙 Verify via Transcript
+      </button>
     </div>
   </div>
   <div id="ctx-status" style="margin-top:8px;font-size:0.82rem;color:var(--muted)"></div>
@@ -322,6 +343,35 @@
         </div>
         {% if cls.imdb_id %}
         <a class="imdb-link" href="https://www.imdb.com/title/{{ cls.imdb_id }}/" target="_blank" rel="noopener">{{ cls.imdb_id }} ↗</a>
+        {% endif %}
+        <!-- How this title's classification was actually determined -- so a
+             number typed into "Episodes on disc" (never verified against the
+             disc's real content) doesn't look identical to one confirmed by
+             dialogue transcript. -->
+        {% if cls._source == 'tmdb_lookup' %}
+        <div style="font-size:0.75rem;color:#e08a8a;margin-top:4px">
+          ℹ From disc position + the episode numbers you typed — <strong style="color:#f0a0a0">NOT verified against dialogue</strong>.
+          Run Verify via Transcript to confirm this is really what's on the disc.
+        </div>
+        {% elif cls._source in ('identifytv_transcript', 'whisper_transcript_verified') %}
+        <div style="font-size:0.75rem;color:#7fbf7f;margin-top:4px">
+          ✓ Confirmed by dialogue transcript match — this is what's actually on the disc.
+        </div>
+        {% endif %}
+        {% if cls.mismatch_with_prior %}
+        <div style="background:#3a1e1e;border:1px solid #7a3232;border-radius:6px;
+                    padding:8px 10px;margin-top:6px;font-size:0.8rem;color:#f0a0a0">
+          ⚠ MISMATCH: you entered
+          {% if cls.prior_classification.season and cls.prior_classification.episode %}
+            S{{ '%02d'|format(cls.prior_classification.season|int) }}E{{ '%02d'|format(cls.prior_classification.episode|int) }}
+          {% else %}
+            episode {{ cls.prior_classification.episode }}
+          {% endif %}
+          {% if cls.prior_classification.episode_title %}({{ cls.prior_classification.episode_title }}){% endif %},
+          but the dialogue transcript says this is actually
+          S{{ '%02d'|format(cls.season|int) }}E{{ '%02d'|format(cls.episode|int) }} — {{ cls.episode_title }}.
+          Trust the transcript match; double-check the sleeve/disc numbering.
+        </div>
         {% endif %}
       {% else %}
         <div class="cls-badge cls-unknown">Unclassified</div>
@@ -501,8 +551,12 @@
     const type = document.querySelector('input[name="ctx-type"]:checked')?.value;
     const tv    = document.getElementById('ctx-tv');
     const movie = document.getElementById('ctx-movie');
+    const vtBtn = document.getElementById('verify-transcript-btn');
+    const clBtn = document.getElementById('classify-all-btn');
     if (tv)    tv.style.display    = type === 'tv'    ? 'flex' : 'none';
     if (movie) movie.style.display = type === 'movie' ? 'flex' : 'none';
+    if (vtBtn) vtBtn.style.display = type === 'tv' ? 'block' : 'none';
+    if (clBtn) clBtn.textContent   = type === 'tv' ? 'Look Up All Episodes' : 'Classify All with Claude';
   }
 
   function _parseEpisodes(str) {
@@ -617,6 +671,23 @@
     const btn    = document.getElementById('classify-all-btn');
     const label  = ctx && ctx.type === 'tv' ? 'Look Up All Episodes' : 'Classify All with Claude';
     if (!ctx) { if (status) status.textContent = 'Save disc context first.'; return; }
+
+    // TV + "Classify All with Claude" only happens if the operator somehow
+    // still has the movie-style button showing for a TV context (shouldn't
+    // normally occur since onCtxType() swaps the label) -- but guard here
+    // too since screenshot-only classification has repeatedly produced
+    // confident-wrong or outright fabricated episode titles on TV discs.
+    // "Look Up All Episodes" (TMDb, deterministic) needs no warning.
+    if (ctx.type === 'tv' && label !== 'Look Up All Episodes') {
+      const proceed = confirm(
+        'Classifying TV episodes with Claude from screenshots alone is ' +
+        'unreliable — it has produced wrong or made-up episode titles before. ' +
+        'Use "Look Up All Episodes" or "Verify via Transcript" instead.\n\n' +
+        'Run Claude classification anyway?'
+      );
+      if (!proceed) { if (status) status.textContent = 'Cancelled.'; return; }
+    }
+
     if (btn) { btn.disabled = true; btn.textContent = 'Running…'; }
     if (status) status.textContent = ctx.type === 'tv'
       ? 'Saving context and looking up episode titles…'
@@ -636,6 +707,34 @@
       .catch(() => {
         if (btn) { btn.disabled = false; btn.textContent = label; }
         if (status) status.textContent = 'Network error.';
+      });
+  }
+
+  function verifyTranscript() {
+    const ctx    = _buildCtx();
+    const status = document.getElementById('ctx-status');
+    const btn    = document.getElementById('verify-transcript-btn');
+    if (!ctx || ctx.type !== 'tv' || !ctx.show) {
+      if (status) status.textContent = 'Save Show + Season in Disc Context first.';
+      return;
+    }
+    if (btn) { btn.disabled = true; btn.textContent = 'Transcribing… (can take a few minutes)'; }
+    if (status) status.textContent = 'Sampling dialogue from each title and matching against episode scripts…';
+
+    apiPost(`/media/job/${JOB_ID}/context`, { disc_context: ctx })
+      .then(() => apiPost(`/media/job/${JOB_ID}/verify-transcript`, {}))
+      .then(r => {
+        if (r.ok) {
+          if (status) status.textContent = 'Running in background — this can take a few minutes for a full disc. Refresh to see results.';
+          setTimeout(() => location.reload(), 15000);
+        } else {
+          if (status) status.textContent = 'Error: ' + (r.error || 'unknown');
+        }
+        if (btn) { btn.disabled = false; btn.textContent = '🎙 Verify via Transcript'; }
+      })
+      .catch(() => {
+        if (status) status.textContent = 'Network error.';
+        if (btn) { btn.disabled = false; btn.textContent = '🎙 Verify via Transcript'; }
       });
   }
 

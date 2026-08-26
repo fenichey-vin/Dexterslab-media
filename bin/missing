@@ -1,0 +1,233 @@
+#!/usr/bin/env python3
+"""
+catalog-status — track missing / skipped media so nothing gets forgotten.
+
+Data lives in   /srv/media/catalog-status/missing.json   (source of truth)
+Rendered as     /srv/media/catalog-status/MISSING.md     (human checklist)
+
+Usage:
+  missing list                 show open items
+  missing list --all           include done/skipped
+  missing scan                 re-detect gaps from the mediaintel catalog
+  missing add "<show>" S1E7 --reason "disc rot"   add a manual item
+  missing done <id>            mark sourced/acquired
+  missing skip <id> --reason   deliberately not getting it
+  missing reopen <id>
+  missing note <id> "<text>"   append a note (e.g. "ordered on eBay 8/22")
+"""
+import json, os, sys, re, argparse, urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+ROOT = Path("/srv/media/catalog-status")
+DATA = ROOT / "missing.json"
+DOC = ROOT / "MISSING.md"
+CACHE = ROOT / ".tvmaze"
+MEDIADB = "/home/vinnie/mediaintel/mediaintel.db"
+TV_ROOT = Path("/srv/media/tv")
+
+ROOT.mkdir(parents=True, exist_ok=True)
+CACHE.mkdir(exist_ok=True)
+
+
+def now():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def load():
+    if DATA.exists():
+        return json.loads(DATA.read_text())
+    return {"items": [], "updated": now()}
+
+
+def save(d):
+    d["updated"] = now()
+    DATA.write_text(json.dumps(d, indent=1))
+    render(d)
+
+
+def tvmaze(show):
+    """Reference episode list, cached on disk so this works offline."""
+    slug = re.sub(r"[^a-z0-9]+", "-", show.lower()).strip("-")
+    f = CACHE / f"{slug}.json"
+    if not f.exists():
+        url = ("https://api.tvmaze.com/singlesearch/shows?q="
+               + urllib.parse.quote(show) + "&embed=episodes")
+        try:
+            with urllib.request.urlopen(url, timeout=25) as r:
+                f.write_bytes(r.read())
+        except Exception as e:
+            print(f"  (could not fetch {show}: {e})")
+            return None
+    return json.loads(f.read_text())
+
+
+def have_episodes():
+    """What's actually on disk, by show -> {(season, ep)}."""
+    got = {}
+    if not TV_ROOT.is_dir():
+        return got
+    for show_dir in sorted(TV_ROOT.iterdir()):
+        if not show_dir.is_dir() or show_dir.name.startswith("."):
+            continue
+        eps = set()
+        for mkv in show_dir.rglob("*.mkv"):
+            m = re.search(r"S(\d{2})E(\d{2})", mkv.name)
+            if m:
+                eps.add((int(m.group(1)), int(m.group(2))))
+        got[show_dir.name] = eps
+    return got
+
+
+def mk_id(show, s, e):
+    slug = re.sub(r"[^a-z0-9]+", "-", show.lower()).strip("-")
+    return f"{slug}-s{s:02d}e{e:02d}"
+
+
+def scan(d):
+    """Compare what's on disk against the reference episode list."""
+    existing = {i["id"] for i in d["items"]}
+    got = have_episodes()
+    added = 0
+    for show, eps in got.items():
+        if not eps:
+            continue
+        ref = tvmaze(show)
+        if not ref:
+            continue
+        seasons_present = {s for s, _ in eps}
+        allref = [x for x in ref["_embedded"]["episodes"]
+                  if x["season"] in seasons_present]
+        for r in allref:
+            key = (r["season"], r["number"])
+            if key in eps:
+                continue
+            iid = mk_id(show, *key)
+            if iid in existing:
+                continue
+            d["items"].append({
+                "id": iid, "show": show, "season": r["season"],
+                "episode": r["number"], "title": r["name"],
+                "status": "missing", "reason": "not ripped yet",
+                "notes": [], "added": now(),
+            })
+            added += 1
+    return added
+
+
+BADGE = {"missing": "[ ]", "done": "[x]", "skipped": "[~]"}
+
+
+def render(d):
+    items = d["items"]
+    open_ = [i for i in items if i["status"] == "missing"]
+    done = [i for i in items if i["status"] == "done"]
+    skip = [i for i in items if i["status"] == "skipped"]
+
+    L = ["# Missing / To Source", "",
+         f"_Updated {d['updated']} — {len(open_)} to source, "
+         f"{len(done)} done, {len(skip)} deliberately skipped._", "",
+         "Edit by hand or use the `missing` command "
+         "(`missing done <id>`, `missing note <id> \"...\"`).", ""]
+
+    if open_:
+        L += ["## Still needed", ""]
+        for show in sorted({i["show"] for i in open_}):
+            rows = sorted([i for i in open_ if i["show"] == show],
+                          key=lambda x: (x["season"], x["episode"]))
+            L.append(f"### {show}")
+            for i in rows:
+                tag = f"S{i['season']:02d}E{i['episode']:02d}"
+                L.append(f"- [ ] **{tag}** {i['title']} — _{i['reason']}_  "
+                         f"`{i['id']}`")
+                for n in i.get("notes", []):
+                    L.append(f"      - {n}")
+            L.append("")
+
+    if skip:
+        L += ["## Deliberately skipped", ""]
+        for i in sorted(skip, key=lambda x: (x["show"], x["season"], x["episode"])):
+            tag = f"S{i['season']:02d}E{i['episode']:02d}"
+            L.append(f"- [~] {i['show']} {tag} {i['title']} — _{i['reason']}_")
+            for n in i.get("notes", []):
+                L.append(f"      - {n}")
+        L.append("")
+
+    if done:
+        L += ["## Done", ""]
+        for i in sorted(done, key=lambda x: (x["show"], x["season"], x["episode"])):
+            tag = f"S{i['season']:02d}E{i['episode']:02d}"
+            L.append(f"- [x] {i['show']} {tag} {i['title']}"
+                     + (f" — {i.get('done_on','')}" if i.get("done_on") else ""))
+        L.append("")
+
+    DOC.write_text("\n".join(L) + "\n")
+
+
+def find(d, iid):
+    for i in d["items"]:
+        if i["id"] == iid or i["id"].endswith(iid):
+            return i
+    sys.exit(f"no item matching '{iid}' — run: missing list")
+
+
+def main():
+    p = argparse.ArgumentParser(prog="missing", add_help=True)
+    sub = p.add_subparsers(dest="cmd")
+    lp = sub.add_parser("list"); lp.add_argument("--all", action="store_true")
+    sub.add_parser("scan")
+    ap = sub.add_parser("add")
+    ap.add_argument("show"); ap.add_argument("tag")
+    ap.add_argument("--title", default=""); ap.add_argument("--reason", default="need to source")
+    for c in ("done", "reopen"):
+        sp = sub.add_parser(c); sp.add_argument("id")
+    sp = sub.add_parser("skip"); sp.add_argument("id"); sp.add_argument("--reason", default="not wanted")
+    np = sub.add_parser("note"); np.add_argument("id"); np.add_argument("text")
+    a = p.parse_args()
+    d = load()
+
+    if a.cmd == "scan":
+        n = scan(d); save(d)
+        print(f"scan complete — {n} new gap(s) found")
+        print(f"checklist: {DOC}")
+    elif a.cmd == "add":
+        m = re.match(r"[sS](\d+)[eE](\d+)", a.tag)
+        if not m:
+            sys.exit("tag must look like S1E7")
+        s, e = int(m.group(1)), int(m.group(2))
+        d["items"].append({"id": mk_id(a.show, s, e), "show": a.show,
+                           "season": s, "episode": e, "title": a.title,
+                           "status": "missing", "reason": a.reason,
+                           "notes": [], "added": now()})
+        save(d); print(f"added {mk_id(a.show, s, e)}")
+    elif a.cmd in ("done", "skip", "reopen"):
+        i = find(d, a.id)
+        i["status"] = {"done": "done", "skip": "skipped", "reopen": "missing"}[a.cmd]
+        if a.cmd == "done":
+            i["done_on"] = now()
+        if a.cmd == "skip":
+            i["reason"] = a.reason
+        save(d); print(f"{i['id']} -> {i['status']}")
+    elif a.cmd == "note":
+        i = find(d, a.id)
+        i.setdefault("notes", []).append(f"{now()}: {a.text}")
+        save(d); print(f"note added to {i['id']}")
+    else:
+        items = d["items"] if (a.cmd == "list" and a.all) else \
+            [i for i in d["items"] if i["status"] == "missing"]
+        if not items:
+            print("nothing outstanding")
+            return
+        cur = None
+        for i in sorted(items, key=lambda x: (x["show"], x["season"], x["episode"])):
+            if i["show"] != cur:
+                cur = i["show"]; print(f"\n{cur}")
+            tag = f"S{i['season']:02d}E{i['episode']:02d}"
+            print(f"  {BADGE[i['status']]} {tag} {i['title'][:38]:<38} "
+                  f"{i['reason'][:34]:<34} {i['id']}")
+        print(f"\nchecklist: {DOC}")
+
+
+if __name__ == "__main__":
+    import urllib.parse
+    main()

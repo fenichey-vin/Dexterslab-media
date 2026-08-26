@@ -257,9 +257,26 @@ def job_detail(job_id):
 
     summary = _build_job_summary(job, titles)
 
+    # Nudge: TV job, fully classified, ready for Approve, but no title has
+    # ever been through transcript verification (identifytv). Screenshot/
+    # TMDb-position classification alone has produced wrong or fabricated
+    # episode labels before -- surface a reminder rather than relying on the
+    # operator to remember to click the button. Purely advisory: never
+    # blocks Approve, and disappears permanently once verify-transcript has
+    # touched at least one title (checked via classification _source).
+    ctx = job.get('disc_context') or _get_effective_context(job)
+    is_tv = bool(ctx and ctx.get('type') == 'tv')
+    show_verify_nudge = (
+        is_tv and job['status'] == 'review'
+        and len(titles) > 0 and classified == len(titles)
+        and not any((t['classification'] or {}).get('_source') in
+                    ('identifytv_transcript', 'whisper_transcript_verified')
+                    for t in titles)
+    )
+
     return render_template('job.html', job=job, titles=titles,
                            classified_count=classified, total_count=len(titles),
-                           summary=summary)
+                           summary=summary, show_verify_nudge=show_verify_nudge)
 
 
 def _build_job_summary(job, titles):
@@ -409,6 +426,73 @@ def classify_all(job_id):
 
     threading.Thread(target=_bg, daemon=True).start()
     return jsonify({'ok': True, 'queued': len(to_classify)})
+
+
+@app.route('/media/job/<job_id>/verify-transcript', methods=['POST'])
+def verify_transcript(job_id):
+    """Identify every title by what's actually SAID in it (local whisper +
+    full-script n-gram match against the real episode list), independent of
+    disc position or screenshots. This is the strongest available signal --
+    stronger than TMDb lookup-by-position, which still trusts disc order.
+
+    Runs bin/identifytv as a background subprocess with --apply, which only
+    writes a suggestion when confidence is high/medium and the runtime looks
+    like a real episode (see identifytv's confidence_script() thresholds).
+    Anything it can't confidently identify is left for manual review rather
+    than guessed. Safe to run on a job mid-rip or already classified --
+    identifytv only reads MKVs, never touches the drive.
+    """
+    job = db.get_job(job_id)
+    if not job:
+        return jsonify({'error': 'Job not found'}), 404
+    ctx = job.get('disc_context') or _get_effective_context(job)
+    if not ctx or ctx.get('type') != 'tv' or not ctx.get('show'):
+        return jsonify({'error': 'Set Disc Context (Show + Season) first — '
+                                  'transcript matching needs to know what show '
+                                  'to check dialogue against.'}), 400
+
+    db.set_job_status(job_id, job['status'], notes='Verifying via transcript…')
+
+    def _bg():
+        try:
+            cmd = ['/home/vinnie/mediaintel/bin/identifytv', job_id,
+                   '--show', ctx['show'], '--apply']
+            if ctx.get('season'):
+                cmd += ['--season', str(ctx['season'])]
+            subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+        except Exception as e:
+            db.set_job_status(job_id, job['status'], notes=f'Transcript verify failed: {e}')
+            return
+        report = Path(job['review_path']) / 'identification.json'
+        note = 'Transcript verification complete — check title cards for any left Unclassified.'
+        if report.exists():
+            try:
+                data = json.loads(report.read_text())
+                low = [r['title_num'] for r in data.get('results', [])
+                       if r.get('confidence') not in ('high', 'medium')]
+                # Also check what identifytv actually wrote to the DB for a
+                # mismatch flag (set when the transcript match disagreed with
+                # whatever "Look Up All Episodes" or a manual entry had) --
+                # this is the real answer to "does the disc match my input".
+                mismatched = [t['title_num'] for t in db.get_titles(job_id)
+                             if (t.get('classification') or {}).get('mismatch_with_prior')]
+                parts = []
+                if mismatched:
+                    parts.append(f'⚠ {len(mismatched)} title(s) DISAGREE with what you entered '
+                                 f'(title_{", title_".join(map(str, mismatched))}) — check those cards')
+                if low:
+                    parts.append(f'{len(low)} title(s) could not be confidently matched '
+                                 f'(title_{", title_".join(map(str, low))})')
+                if parts:
+                    note = 'Transcript verification complete — ' + '; '.join(parts) + '.'
+                else:
+                    note = 'Transcript verification complete — every title agrees with what you entered.'
+            except Exception:
+                pass
+        db.set_job_status(job_id, job['status'], notes=note)
+
+    threading.Thread(target=_bg, daemon=True).start()
+    return jsonify({'ok': True})
 
 
 # ── JSON export ───────────────────────────────────────────────────────────────
@@ -967,6 +1051,30 @@ def _encode_job_bg(job_id):
     with open(cls_file) as f:
         classifications = json.load(f)
 
+    # ---- DB is the source of truth for classification, not the JSON file ----
+    # classification.json is written once by the auto-classifier. When a human
+    # corrects a title in the dashboard, only titles.classification is updated,
+    # so the file goes stale. Encoding from the stale file is what silently
+    # produced wrongly-numbered episodes (Sopranos S01, Seinfeld S02).
+    # Overlay the DB rows on top of the file, and rewrite the file so review
+    # dir and DB agree from here on.
+    _db_titles = {t['title_num']: t for t in db.get_titles(job_id)}
+    _overridden = []
+    for _n, _t in _db_titles.items():
+        _cls = _t.get('classification')
+        if not _cls:
+            continue
+        _key = f'title_{_n}'
+        if classifications.get(_key) != _cls:
+            classifications[_key] = _cls
+            _overridden.append(_key)
+    if _overridden:
+        try:
+            with open(cls_file, 'w') as f:
+                json.dump(classifications, f, indent=2)
+        except OSError:
+            pass
+
     # Build list of encodable titles up front for total count
     encodable = []
     for key, cls in sorted(classifications.items()):
@@ -978,6 +1086,47 @@ def _encode_job_bg(job_id):
         encodable.append((int(m.group(1)), cls))
 
     _log(f'=== Encode start (staging): {job["name"]} ({job_id}) — {len(encodable)} titles ===')
+    if _overridden:
+        _log(f'INFO {job_id}: classification.json was stale; used DB values for '
+             f'{", ".join(sorted(_overridden))}')
+
+    # ---- runtime sanity gate -------------------------------------------
+    # A "TV episode" that runs 112 minutes is a feature film, and a "movie"
+    # that runs 4 minutes is a bonus feature. Both mistakes reached the
+    # library before (TMNT films filed as cartoon episodes, Seinfeld
+    # featurettes numbered as episodes). Refuse to stage anything whose
+    # runtime is wildly inconsistent with its declared type.
+    _titles_by_num = {t['title_num']: t for t in db.get_titles(job_id)}
+    _gated = []
+    for _n, _cls in list(encodable):
+        _secs = (_titles_by_num.get(_n) or {}).get('duration_secs') or 0
+        _mins = _secs / 60.0
+        _t = _cls.get('type')
+        _why = None
+        if _t == 'tv_episode':
+            if _mins > 75:
+                _why = (f'{_mins:.0f}min is too long for a TV episode — '
+                        f'likely a feature film or a play-all title')
+            elif 0 < _mins < 12:
+                _why = (f'{_mins:.0f}min is too short for a TV episode — '
+                        f'likely a bonus feature or menu clip')
+        elif _t in ('movie', 'documentary') and 0 < _mins < 40:
+            _why = f'{_mins:.0f}min is too short for a feature — likely an extra'
+        if _why:
+            _gated.append((_n, _why))
+    if _gated:
+        for _n, _why in _gated:
+            _log(f'BLOCKED {job_id} title_{_n}: {_why}')
+        encodable = [(n, c) for n, c in encodable
+                     if n not in {g[0] for g in _gated}]
+        _note = '; '.join(f'title_{n}: {w}' for n, w in _gated)
+        db.set_job_status(job_id, 'review',
+                          notes=f'Runtime check flagged {len(_gated)} title(s) '
+                                f'— reclassify before encoding. {_note}')
+        if not encodable:
+            _log(f'=== Encode aborted: all titles failed the runtime check ===')
+            return
+
     ok = fail = 0
 
     for title_idx, (title_num, cls) in enumerate(encodable):
@@ -1403,6 +1552,21 @@ def _rip_disc_bg(job_id, device, title_nums, disc_context):
         db.set_job_status(job_id, 'review')
 
         # ── Phase 2: screenshots + classification (drive no longer needed) ────
+        # TV titles are NEVER auto-classified with Claude here. Screenshot-only
+        # guessing on TV episodes has repeatedly produced confident-wrong or
+        # fabricated episode titles (see media-library-integrity skill) --
+        # disc position/order is not a reliable signal and 3 static frames
+        # aren't enough to distinguish episodes of the same show. TV titles
+        # are left Unclassified so the operator must fill in Disc Context
+        # (real episode numbers off the sleeve) and either run
+        # "Look Up All Episodes" (deterministic TMDb lookup) or
+        # "Verify via Transcript" (dialogue match) -- both far stronger
+        # signals than screenshots. Movies/specials still use Claude since a
+        # single feature-length title is easy to identify visually and has
+        # no sibling episodes to confuse it with.
+        effective_ctx = disc_context or _get_effective_context(job)
+        is_tv_job = bool(effective_ctx and effective_ctx.get('type') == 'tv')
+
         for title_num, mkv, duration in ripped:
             try:
                 title_dir   = job_dir / f'title_{title_num}'
@@ -1412,6 +1576,8 @@ def _rip_disc_bg(job_id, device, title_nums, disc_context):
                 if duration and duration < 480:
                     # Under 8 minutes — auto-classify as Special Features
                     _auto_classify_short(job_id, title_num, disc_context)
+                elif is_tv_job:
+                    pass  # leave unclassified — see comment above
                 elif ANTHROPIC_API_KEY:
                     _auto_classify_one(job_id, title_num, disc_context)
 
@@ -1499,6 +1665,76 @@ def _dur_str(secs):
     return f'{h}:{m:02d}:{s:02d}'
 
 
+def _last_tv_context():
+    """Return {'show','season'} from the most recently created TV job, so the
+    rip page can pre-fill the show name (rarely changes disc to disc) while
+    leaving season and episode numbers for the operator to type off the
+    sleeve. This replaces a Claude text-guess that inferred season/episode
+    from disc label + title durations alone -- with no real signal to work
+    from (disc labels are usually blank), it fabricated plausible-looking
+    but wrong episode ranges every time. Duration/order carry no identity
+    information; only the person holding the disc knows which one it is.
+    """
+    try:
+        for j in db.get_all_jobs():
+            ctx = j.get('disc_context')
+            if ctx and ctx.get('type') == 'tv' and ctx.get('show'):
+                return {'type': 'tv', 'show': ctx['show'], 'season': ctx.get('season')}
+    except Exception:
+        pass
+    return None
+
+
+def _infer_from_disc_label(show, disc_label):
+    """If the disc's own volume label carries a literal disc number (e.g.
+    "LAW_ORDER_SVU_DISC6"), suggest a season/episode range for it by
+    combining that REAL, physically-burned number with the operator's own
+    established per-disc episode count from prior rips of the same show
+    (e.g. 4 episodes/disc, confirmed by hand on discs 2-4).
+
+    This is fundamentally different from the banned duration/order-based
+    guessing: the disc number itself isn't inferred, it's literally printed
+    on the disc by the studio and read via blkid -- as reliable as reading
+    the sleeve. The episode range built from it is still just a SUGGESTION
+    the operator must confirm/correct before ripping (pre-filled, editable,
+    never silently applied) -- e.g. a show's last disc in a season is often
+    a half-disc (fewer episodes), which this can't know about.
+
+    Returns None (leaving fields blank as before) when there's no disc
+    number to read, or no prior per-disc pattern to reuse.
+    """
+    if not show or not disc_label:
+        return None
+    m = re.search(r'DISC\D{0,3}(\d{1,2})\b', disc_label, re.I)
+    if not m:
+        return None
+    disc_num = int(m.group(1))
+
+    jobs = [j for j in db.get_all_jobs()
+            if (j.get('disc_context') or {}).get('type') == 'tv'
+            and (j['disc_context'].get('show') or '').strip().lower() == show.strip().lower()
+            and j['disc_context'].get('episodes')]
+    if not jobs:
+        return None
+
+    from collections import Counter
+    per_disc_counts = Counter(len(j['disc_context']['episodes']) for j in jobs)
+    per_disc = per_disc_counts.most_common(1)[0][0]
+    if per_disc <= 0:
+        return None
+    season_counts = Counter(j['disc_context'].get('season') for j in jobs
+                            if j['disc_context'].get('season'))
+    season = season_counts.most_common(1)[0][0] if season_counts else None
+
+    start = (disc_num - 1) * per_disc + 1
+    end = disc_num * per_disc
+    return {
+        'type': 'tv', 'show': show, 'season': season,
+        'episodes': list(range(start, end + 1)),
+        '_source': 'disc_label_pattern', '_disc_num': disc_num, '_per_disc': per_disc,
+    }
+
+
 def _scan_disc_bg(device):
     try:
         titles, disc_label = scan_disc(device)
@@ -1506,9 +1742,21 @@ def _scan_disc_bg(device):
         for t in titles:
             t['dur_str'] = _dur_str(t['dur_secs'])
 
+        # No LLM guessing here. Two tiers of real signal only:
+        #  1. The disc's own volume label, when it carries a literal disc
+        #     number (e.g. "LAW_ORDER_SVU_DISC6") -- combined with the
+        #     operator's own established per-disc episode count from prior
+        #     rips of the same show, to suggest a season/episode range.
+        #  2. Falls back to just the show name carried over from the last
+        #     TV job if no disc-number pattern is found.
+        # Either way this is a pre-filled SUGGESTION the operator confirms/
+        # edits before ripping -- never silently trusted.
+        last_ctx = _last_tv_context()
         disc_id = None
-        if ANTHROPIC_API_KEY:
-            disc_id = _identify_disc_with_claude(disc_label, titles)
+        if last_ctx and last_ctx.get('show'):
+            disc_id = _infer_from_disc_label(last_ctx['show'], disc_label)
+        if not disc_id:
+            disc_id = last_ctx
 
         _scan_state[device] = {
             'status': 'done',

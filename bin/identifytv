@@ -1,0 +1,588 @@
+#!/usr/bin/env python3
+"""
+identifytv — identify ripped DVD titles by what is actually SAID in them.
+
+Screenshots and disc order both lie. Disc order especially: HBO/Sony sets
+routinely press episodes out of broadcast order, which is how Sopranos S01
+and Seinfeld S02 ended up scrambled. This samples the audio, transcribes it
+locally with faster-whisper (zero API cost), and matches the dialogue against
+the real episode list from TVmaze.
+
+Nothing is written to the library. It produces a ranked suggestion per title
+with the matching dialogue as evidence, and (with --apply) stages those
+suggestions into mediaintel's DB for you to approve in the dashboard.
+
+Usage
+  identifytv                          pick a job interactively
+  identifytv <job-id>                 identify one job
+  identifytv <job-id> --apply         also write suggestions into the DB
+  identifytv <job-id> --show "Seinfeld" --season 2
+  identifytv <job-id> --force         re-transcribe (ignore cache)
+
+Safe to run while a rip is in progress: read-mostly, short DB transactions,
+60s busy timeout, and it never touches the drive or the review MKVs.
+"""
+import argparse, json, os, re, sqlite3, subprocess, sys, tempfile, urllib.parse
+import urllib.request
+from collections import Counter
+from datetime import datetime, timezone
+from pathlib import Path
+
+MEDIA_DB = "/home/vinnie/mediaintel/mediaintel.db"
+REVIEW_ROOT = Path("/srv/work/review")
+CACHE = Path("/srv/media/catalog-status/.identify-cache")
+WHISPER_PY = Path.home() / "venvs/transcribe/bin/python"
+SAMPLE_SECS = 75
+
+CACHE.mkdir(parents=True, exist_ok=True)
+SCRIPT_CACHE = CACHE / "scripts"
+SCRIPT_CACHE.mkdir(parents=True, exist_ok=True)
+
+# Below this many chars, springfieldspringfield returned a stub ("Previous
+# Episode Next Episode") rather than a real transcript -- treat as missing.
+MIN_SCRIPT_CHARS = 800
+
+# words too common in TV dialogue to carry signal
+STOP = set("""a an and the this that these those i you he she it we they me him her
+us them my your his its our their is are was were be been being am do does did
+doing have has had having will would can could should shall may might must not
+no yes so if then than but or as of at by for with about into over after under
+to from up down out on off in there here what which who whom whose when where why
+how all any both each few more most other some such only own same too very just
+now get got go going gone come came know knew think thought want wanted say said
+says tell told talk see saw look looked well okay ok yeah yep nope hey oh uh um
+gonna gotta wanna like really right good bad thing things guy guys man woman
+people time day night one two three back never always something anything nothing
+everything someone anyone everyone because make made take took give gave put""".split())
+
+
+def norm(text):
+    # strip contractions so "he's"/"that's" collapse to stopwords instead of
+    # surviving as fake evidence
+    t = re.sub(r"'(s|re|ve|ll|d|t|m)\b", "", (text or "").lower())
+    return [w for w in re.findall(r"[a-z]{3,}", t) if w not in STOP]
+
+
+def ngrams(words, n=4):
+    return set(tuple(words[i:i + n]) for i in range(len(words) - n + 1))
+
+
+def ngram_phrase(gram):
+    return " ".join(gram)
+
+
+def db_connect():
+    c = sqlite3.connect(MEDIA_DB, timeout=60)
+    c.row_factory = sqlite3.Row
+    c.execute("PRAGMA busy_timeout=60000")
+    return c
+
+
+# ---------------------------------------------------------------- reference
+def tvmaze(show):
+    slug = re.sub(r"[^a-z0-9]+", "-", show.lower()).strip("-")
+    f = CACHE / f"tvmaze-{slug}.json"
+    if not f.exists():
+        url = ("https://api.tvmaze.com/singlesearch/shows?q="
+               + urllib.parse.quote(show) + "&embed=episodes")
+        try:
+            with urllib.request.urlopen(url, timeout=25) as r:
+                f.write_bytes(r.read())
+        except Exception as e:
+            print(f"  ! could not reach TVmaze for {show!r}: {e}")
+            return None
+    try:
+        return json.loads(f.read_text())
+    except Exception:
+        return None
+
+
+def episode_pool(show, season):
+    ref = tvmaze(show)
+    if not ref:
+        return [], None
+    imdb = (ref.get("externals") or {}).get("imdb")
+    eps = []
+    for e in ref["_embedded"]["episodes"]:
+        if season and e["season"] != season:
+            continue
+        summary = re.sub(r"<[^>]+>", " ", e.get("summary") or "")
+        eps.append({"season": e["season"], "episode": e["number"],
+                    "title": e["name"], "summary": summary,
+                    "runtime": e.get("runtime")})
+    return eps, imdb
+
+
+# ---------------------------------------------------------------- full scripts
+# TVmaze summaries are 1-2 sentences -- far too little signal to distinguish
+# episodes of the same show (see: bag-of-words scoring 1/4 correct on
+# Sopranos S01, with a confident WRONG match). Full episode transcripts from
+# a fan-transcript site give 100x the words and near-verbatim dialogue
+# overlap with what whisper actually hears, which is a vastly stronger
+# reference. When unavailable, callers must fall back to the summary-only
+# path with capped confidence -- never silently skip the extra signal.
+SCRIPT_SITE = "https://www.springfieldspringfield.co.uk/view_episode_scripts.php"
+
+
+# Show names don't always slug into springfieldspringfield.co.uk's actual URL
+# slug (e.g. "Law and Order: SVU" -> "law-and-order-svu" is wrong; the site
+# uses "law-and-order-special-victims-unit"). A wrong slug returns a short
+# stub page that looked like "no script" and got cached as empty forever --
+# permanently and silently degrading every future match for that show to
+# weak summary-only confidence. Known aliases go here; add more as they're
+# discovered rather than trusting the naive slugify.
+SLUG_ALIASES = {
+    "law-and-order-svu": "law-and-order-special-victims-unit",
+    "law-order-svu": "law-and-order-special-victims-unit",
+}
+
+
+def fetch_episode_script(show, season, episode):
+    slug = re.sub(r"[^a-z0-9]+", "-", show.lower()).strip("-")
+    slug = SLUG_ALIASES.get(slug, slug)
+    f = SCRIPT_CACHE / f"{slug}-s{season:02d}e{episode:02d}.txt"
+    if f.exists():
+        text = f.read_text()
+        return text if len(text) >= MIN_SCRIPT_CHARS else None
+    url = (f"{SCRIPT_SITE}?tv-show={urllib.parse.quote(slug)}"
+           f"&episode=s{season:02d}e{episode:02d}")
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            html = r.read().decode("utf-8", "ignore")
+    except Exception:
+        return None
+    m = re.search(r'<div class="scrolling-script-container">(.*?)</div>\s*</div>',
+                  html, re.S)
+    text = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", m.group(1))).strip() if m else ""
+    f.write_text(text)
+    return text if len(text) >= MIN_SCRIPT_CHARS else None
+
+
+def attach_scripts(show, season, eps):
+    """Best-effort: fetch a full transcript per episode, cached on disk.
+    Mutates eps in place, adding 'script' (may be None)."""
+    got = 0
+    for e in eps:
+        e["script"] = fetch_episode_script(show, season, e["episode"])
+        if e["script"]:
+            got += 1
+    return got
+
+
+# ---------------------------------------------------------------- transcribe
+_model = None
+
+
+def transcribe(mkv, starts):
+    """Sample a few windows of audio and return their combined text."""
+    global _model
+    code = r'''
+import sys, json, subprocess, tempfile, os
+from faster_whisper import WhisperModel
+mkv, starts = sys.argv[1], [int(x) for x in sys.argv[2].split(",")]
+m = WhisperModel("base", device="cpu", compute_type="int8")
+out = []
+for s in starts:
+    wav = tempfile.mktemp(suffix=".wav")
+    r = subprocess.run(["ffmpeg","-v","error","-y","-ss",str(s),"-t","%d",
+                        "-i",mkv,"-ac","1","-ar","16000",wav],
+                       capture_output=True)
+    if r.returncode != 0 or not os.path.exists(wav):
+        continue
+    segs,_ = m.transcribe(wav, beam_size=1)
+    out.append(" ".join(x.text.strip() for x in segs))
+    os.unlink(wav)
+print(json.dumps(out))
+''' % SAMPLE_SECS
+    r = subprocess.run([str(WHISPER_PY), "-c", code, str(mkv),
+                        ",".join(str(s) for s in starts)],
+                       capture_output=True, text=True, timeout=1800)
+    if r.returncode != 0:
+        return None
+    try:
+        return " ".join(json.loads(r.stdout.strip().splitlines()[-1]))
+    except Exception:
+        return None
+
+
+def duration(path):
+    r = subprocess.run(["ffprobe", "-v", "error", "-show_entries",
+                        "format=duration", "-of", "default=nw=1:nk=1", str(path)],
+                       capture_output=True, text=True)
+    try:
+        return float(r.stdout.strip())
+    except Exception:
+        return 0.0
+
+
+# ---------------------------------------------------------------- matching
+def score(transcript, eps):
+    """Rank candidate episodes against a transcript.
+
+    Weights rare words heavily: a word appearing in only one episode summary
+    is far more diagnostic than one appearing in all of them ('Jerry').
+    """
+    twords = Counter(norm(transcript))
+    if not twords:
+        return []
+    df = Counter()
+    for e in eps:
+        for w in set(norm(e["title"] + " " + e["summary"])):
+            df[w] += 1
+    n = max(1, len(eps))
+    ranked = []
+    for e in eps:
+        ewords = set(norm(e["title"] + " " + e["summary"]))
+        hits, pts = [], 0.0
+        for w in ewords:
+            if twords.get(w):
+                rarity = (n / df[w]) ** 1.5      # rare -> big boost
+                pts += rarity * min(twords[w], 3)
+                hits.append(w)
+        # exact episode-title phrase in the dialogue is a strong signal, but
+        # only when the title is distinctive. "46 Long" tokenises to ["long"]
+        # and "A Hit is a Hit" to ["hit"], which fire on almost any transcript
+        # and produced confident WRONG matches in testing. Require a
+        # multi-word, reasonably long phrase before trusting it.
+        tl_tokens = norm(e["title"])
+        tl = " ".join(tl_tokens)
+        if (len(set(tl_tokens)) >= 2 and len(tl) >= 10
+                and tl in " ".join(norm(transcript))):
+            pts *= 2.5
+            hits.append(f"TITLE PHRASE:{e['title']}")
+        ranked.append({"season": e["season"], "episode": e["episode"],
+                       "title": e["title"], "points": round(pts, 1),
+                       "hits": sorted(hits, key=len, reverse=True)[:8]})
+    ranked.sort(key=lambda x: -x["points"])
+    return ranked
+
+
+def confidence(ranked):
+    if not ranked or ranked[0]["points"] <= 0:
+        return "none", 0.0
+    top = ranked[0]["points"]
+    second = ranked[1]["points"] if len(ranked) > 1 else 0.0
+    margin = (top - second) / top if top else 0
+    if top >= 25 and margin >= 0.45:
+        return "high", margin
+    if top >= 12 and margin >= 0.22:
+        return "medium", margin
+    return "low", margin
+
+
+def score_summary(transcript, eps):
+    """Original bag-of-words vs TVmaze summary. Kept ONLY as a last-resort
+    fallback when no full script could be fetched for any candidate episode
+    -- summaries are too short (1-2 sentences) to trust at high confidence,
+    so this path is capped at 'low' by confidence_summary() no matter the
+    score. Do not raise that cap; it is what stopped the Sopranos S01
+    confident-wrong misfire during development."""
+    twords = Counter(norm(transcript))
+    if not twords:
+        return []
+    df = Counter()
+    for e in eps:
+        for w in set(norm(e["title"] + " " + e["summary"])):
+            df[w] += 1
+    n = max(1, len(eps))
+    ranked = []
+    for e in eps:
+        ewords = set(norm(e["title"] + " " + e["summary"]))
+        hits, pts = [], 0.0
+        for w in ewords:
+            if twords.get(w):
+                rarity = (n / df[w]) ** 1.5
+                pts += rarity * min(twords[w], 3)
+                hits.append(w)
+        ranked.append({"season": e["season"], "episode": e["episode"],
+                       "title": e["title"], "points": round(pts, 1),
+                       "hits": sorted(hits, key=len, reverse=True)[:8],
+                       "method": "summary-bow"})
+    ranked.sort(key=lambda x: -x["points"])
+    return ranked
+
+
+def confidence_summary(ranked):
+    """Summaries are too thin to ever be trusted at high/medium confidence
+    -- always 'low' or 'none'. This is what forces a human decision instead
+    of a confident wrong guess when full scripts aren't available."""
+    if not ranked or ranked[0]["points"] <= 0:
+        return "none", 0.0
+    top = ranked[0]["points"]
+    second = ranked[1]["points"] if len(ranked) > 1 else 0.0
+    margin = (top - second) / top if top else 0
+    if top >= 8 and margin >= 0.3:
+        return "low", margin
+    return "none", margin
+
+
+def score_script(transcript, eps, n=4):
+    """Rank candidates by n-gram (default 4-word phrase) overlap between the
+    whisper transcript and each episode's FULL fan-transcribed script.
+
+    This is the primary matcher. Validated against Sopranos S01 titles 0-3
+    (ground truth E09-E12): true episode scored 113-190 shared 4-grams vs.
+    0-5 for every wrong candidate -- a >95% margin every time, and zero
+    false positives. Bag-of-words-vs-summary only got 1/4 right and
+    produced a confident WRONG match on the same data.
+    """
+    twords = norm(transcript)
+    tgrams = ngrams(twords, n)
+    if not tgrams:
+        return []
+    ranked = []
+    for e in eps:
+        if not e.get("script"):
+            continue
+        egrams = ngrams(norm(e["script"]), n)
+        shared = tgrams & egrams
+        example = ngram_phrase(next(iter(shared))) if shared else ""
+        ranked.append({"season": e["season"], "episode": e["episode"],
+                       "title": e["title"], "points": float(len(shared)),
+                       "hits": [ngram_phrase(g) for g in
+                                sorted(shared, key=len, reverse=True)[:6]],
+                       "example_phrase": example, "method": "script-ngram"})
+    ranked.sort(key=lambda x: -x["points"])
+    return ranked
+
+
+def confidence_script(ranked):
+    """Thresholds set from the Sopranos S01 validation run (margins were
+    95-99%, top scores 113-190). Deliberately conservative: require a
+    real absolute score AND a dominant margin over the runner-up, or drop
+    to 'low'/'none' rather than guess. A wrong high-confidence call is far
+    worse than an extra human review, so these bars are strict on purpose
+    -- do not loosen without re-running the validation harness."""
+    if not ranked or ranked[0]["points"] <= 0:
+        return "none", 0.0
+    top = ranked[0]["points"]
+    second = ranked[1]["points"] if len(ranked) > 1 else 0.0
+    margin = (top - second) / top if top else 0
+    if top >= 20 and margin >= 0.75:
+        return "high", margin
+    if top >= 8 and margin >= 0.5:
+        return "medium", margin
+    if top >= 3:
+        return "low", margin
+    return "none", margin
+
+
+# ---------------------------------------------------------------- main
+def pick_job(conn):
+    rows = conn.execute("""select id,name,status,title_count from jobs
+                           where status in ('ripped','review','staged','encoding')
+                           order by created_at desc limit 25""").fetchall()
+    if not rows:
+        rows = conn.execute("select id,name,status,title_count from jobs "
+                            "order by created_at desc limit 25").fetchall()
+    for i, r in enumerate(rows, 1):
+        print(f"  {i:2d}. {r['id'][:52]:<52} {r['status']:<9} "
+              f"{r['title_count']} titles")
+    try:
+        n = int(input("\npick a job number: "))
+        return rows[n - 1]["id"]
+    except Exception:
+        sys.exit("cancelled")
+
+
+def main():
+    p = argparse.ArgumentParser(prog="identifytv")
+    p.add_argument("job", nargs="?")
+    p.add_argument("--show"); p.add_argument("--season", type=int)
+    p.add_argument("--apply", action="store_true",
+                   help="write suggestions into mediaintel for dashboard approval")
+    p.add_argument("--force", action="store_true", help="ignore transcript cache")
+    a = p.parse_args()
+
+    conn = db_connect()
+    job_id = a.job or pick_job(conn)
+    job = conn.execute("select * from jobs where id=?", (job_id,)).fetchone()
+    if not job:
+        sys.exit(f"no such job: {job_id}")
+    titles = conn.execute("select * from titles where job_id=? order by title_num",
+                          (job_id,)).fetchall()
+    if not titles:
+        sys.exit(f"job {job_id} has no titles")
+
+    # work out the show/season
+    show, season = a.show, a.season
+    if not show or season is None:
+        for t in titles:
+            try:
+                c = json.loads(t["classification"] or "{}")
+            except Exception:
+                c = {}
+            show = show or c.get("show")
+            if season is None and c.get("season"):
+                season = c["season"]
+    if not show:
+        m = re.match(r"(.+?)-S(\d+)-\d{8,}", job_id)
+        if m:
+            show = m.group(1).replace("-", " ")
+            season = season or int(m.group(2))
+    if not show:
+        sys.exit("could not determine the show — pass --show \"Name\" --season N")
+
+    eps, imdb = episode_pool(show, season)
+    print(f"\njob   : {job_id}")
+    print(f"show  : {show}  season {season}   ({len(eps)} reference episodes"
+          + (f", imdb {imdb}" if imdb else "") + ")")
+    print(f"titles: {len(titles)}\n")
+    if not eps:
+        sys.exit("no reference episodes — check the show name")
+
+    print("fetching full episode scripts (stronger reference than summaries)...")
+    n_scripts = attach_scripts(show, season, eps)
+    if n_scripts:
+        print(f"  -> got {n_scripts}/{len(eps)} full scripts "
+              f"(script-ngram match will be used where available)")
+    else:
+        print("  -> no full scripts found; falling back to TVmaze summaries "
+              "only (capped at 'low' confidence — never guesses high)")
+
+    review = Path(job["review_path"])
+    results, used = [], set()
+
+    for t in titles:
+        n = t["title_num"]
+        tdir = review / f"title_{n}"
+        mkvs = sorted(tdir.glob("*.mkv"))
+        if not mkvs:
+            print(f"title_{n}: no mkv, skipping")
+            continue
+        mkv = mkvs[0]
+        dur = t["duration_secs"] or duration(mkv)
+        mins = dur / 60
+
+        cache_f = CACHE / f"{job_id}-title{n}.txt"
+        if cache_f.exists() and not a.force:
+            text = cache_f.read_text()
+        else:
+            starts = [90, int(dur * 0.45), int(dur * 0.75)] if dur > 600 else [30]
+            starts = [s for s in starts if s < dur - 30]
+            print(f"title_{n}: transcribing {len(starts)} sample(s) "
+                  f"of {mins:.0f}min ...", flush=True)
+            text = transcribe(mkv, starts) or ""
+            cache_f.write_text(text)
+
+        eps_with_script = [e for e in eps if e.get("script")]
+        if eps_with_script:
+            ranked = score_script(text, eps_with_script)
+            conf, margin = confidence_script(ranked)
+            method = "script-ngram"
+        else:
+            ranked = score_summary(text, eps)
+            conf, margin = confidence_summary(ranked)
+            method = "summary-bow (weak signal, capped confidence)"
+        best = ranked[0] if ranked else None
+
+        # runtime plausibility, same rule the encoder enforces
+        flag = ""
+        if mins > 75:
+            flag = "  [!] too long for an episode — film or play-all?"
+        elif 0 < mins < 12:
+            flag = "  [!] too short for an episode — bonus feature?"
+
+        print(f"\n=== title_{n}  ({mins:.0f} min){flag}")
+        print(f"     method: {method}")
+        if not best or conf == "none":
+            print("    no usable dialogue match")
+        else:
+            for r in ranked[:3]:
+                mark = "->" if r is best else "  "
+                print(f"  {mark} S{r['season']:02d}E{r['episode']:02d} "
+                      f"{r['title'][:40]:<40} score {r['points']:7.1f}")
+            print(f"     confidence: {conf} (margin {margin:.0%})")
+            print(f"     evidence  : {', '.join(best['hits'][:6])}")
+            if best and (best["season"], best["episode"]) in used:
+                print("     [!] this episode was already matched to an earlier "
+                      "title — check both")
+            used.add((best["season"], best["episode"]))
+
+        results.append({"title_num": n, "minutes": round(mins, 1),
+                        "flag": flag.strip(), "confidence": conf,
+                        "method": method,
+                        "best": best, "runner_up": ranked[1] if len(ranked) > 1 else None,
+                        "transcript_chars": len(text)})
+
+    out = review / "identification.json"
+    out.write_text(json.dumps(
+        {"job": job_id, "show": show, "season": season, "imdb": imdb,
+         "generated": datetime.now(timezone.utc).isoformat(),
+         "results": results}, indent=1))
+    print(f"\nreport -> {out}")
+
+    if a.apply:
+        applied = 0
+        mismatches = []
+        for r in results:
+            b = r["best"]
+            if not b or r["confidence"] not in ("high", "medium") or r["flag"]:
+                continue
+
+            # Compare against whatever was already classified for this title
+            # (e.g. from "Look Up All Episodes", which just echoes back
+            # whatever season/episode number the operator typed in --  it has
+            # NO independent way to confirm that's actually what's on the
+            # disc). This transcript match is real content-based evidence, so
+            # a disagreement here means the earlier number was probably
+            # wrong -- surface that loudly instead of silently overwriting it.
+            prior_row = conn.execute(
+                "select classification from titles where job_id=? and title_num=?",
+                (job_id, r["title_num"])
+            ).fetchone()
+            prior = None
+            try:
+                prior = json.loads(prior_row["classification"]) if prior_row and prior_row["classification"] else None
+            except Exception:
+                prior = None
+            prior_ep = (prior or {}).get("episode")
+            prior_season = (prior or {}).get("season")
+            mismatch = bool(
+                prior and prior.get("type") == "tv_episode"
+                and prior_ep is not None
+                and (prior_season, prior_ep) != (b["season"], b["episode"])
+            )
+
+            cls = {"type": "tv_episode", "show": show, "season": b["season"],
+                   "episode": b["episode"], "episode_title": b["title"],
+                   "imdb_id": imdb, "confidence": r["confidence"],
+                   "reasoning": f"dialogue match via {r['method']} "
+                                f"(score {b['points']}, {r['confidence']} "
+                                f"confidence): {', '.join(b['hits'][:6])}",
+                   "_source": "identifytv_transcript"}
+
+            if mismatch:
+                cls["mismatch_with_prior"] = True
+                cls["prior_classification"] = {
+                    "season": prior_season, "episode": prior_ep,
+                    "episode_title": prior.get("episode_title"),
+                    "source": prior.get("_source"),
+                }
+                mismatches.append({
+                    "title_num": r["title_num"],
+                    "prior": f"S{prior_season:02d}E{prior_ep:02d}" if prior_season and prior_ep else f"E{prior_ep}",
+                    "transcript": f"S{b['season']:02d}E{b['episode']:02d} {b['title']}",
+                })
+
+            conn.execute("update titles set classification=?, "
+                         "classified_at=datetime('now') where job_id=? and title_num=?",
+                         (json.dumps(cls), job_id, r["title_num"]))
+            applied += 1
+        conn.commit()
+        print(f"applied {applied} suggestion(s) to mediaintel — "
+              f"review and Save in the dashboard before encoding")
+        if mismatches:
+            print(f"\n[!] {len(mismatches)} title(s) DISAGREE with the season/episode "
+                  f"number you had entered:")
+            for m in mismatches:
+                print(f"    title_{m['title_num']}: you had {m['prior']}, "
+                      f"transcript says {m['transcript']}")
+    else:
+        print("(run again with --apply to stage these into the dashboard)")
+    conn.close()
+
+
+if __name__ == "__main__":
+    main()

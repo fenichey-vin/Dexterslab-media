@@ -321,11 +321,10 @@ document.addEventListener('keydown', e => {
 // ── Job approval ───────────────────────────────────────────────────────────────
 
 function approveJob(jobId) {
-  if (!confirm('Mark all titles approved and write classification.json?')) return;
   apiPost(`/media/job/${jobId}/approve`, {})
     .then(r => {
       if (r.ok) {
-        location.reload();
+        window.location.href = '/media/';
       } else {
         alert('Error: ' + (r.error || 'unknown'));
       }
@@ -334,11 +333,16 @@ function approveJob(jobId) {
 }
 
 function approveAndEncode(jobId) {
-  if (!confirm('Approve all classifications and start encoding immediately?')) return;
   apiPost(`/media/job/${jobId}/approve`, { auto_encode: true })
     .then(r => {
-      if (r.ok) location.reload();
-      else alert('Error: ' + (r.error || 'unknown'));
+      if (r.ok) {
+        // Any failure past this point happens asynchronously during the actual
+        // encode -- that shows up on the job's card in the dashboard's Failed
+        // section (with a Retry Encode button) once/if it happens, not here.
+        window.location.href = '/media/';
+      } else {
+        alert('Error: ' + (r.error || 'unknown'));
+      }
     })
     .catch(e => alert('Network error: ' + e));
 }

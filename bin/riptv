@@ -222,8 +222,11 @@ def flag_titles(titles):
         if d == 0:
             flags.append('no_duration')
 
-        # Near-duplicate duration
-        dupes = sum(1 for t2 in titles if t2['num'] != t['num'] and abs(t2['dur_secs'] - d) < 30)
+        # Near-duplicate duration: TV episodes in the same season are ALWAYS
+        # within a minute or two of each other by design -- a 30s window
+        # flagged basically every title on every TV disc, which is noise,
+        # not signal. Tightened to 3s (kept identical to app.py's flag_titles).
+        dupes = sum(1 for t2 in titles if t2['num'] != t['num'] and abs(t2['dur_secs'] - d) < 3)
         if dupes:
             flags.append('possible_duplicate')
 
