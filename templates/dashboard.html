@@ -224,14 +224,25 @@
   </h2>
   <div class="job-grid">
     {% for job in completed %}
-    <a href="/media/job/{{ job.id }}" class="job-card {{ job.status }}">
-      <div class="job-card-name">{{ job.name }}</div>
-      <div class="job-card-meta">
-        <span class="badge {{ job.status }}">{{ job.status | capitalize }}</span>
-        <span>{{ job.title_count }} title{{ 's' if job.title_count != 1 else '' }}</span>
-      </div>
-      <div class="job-card-time">{{ job.created_at | reltime }}</div>
-    </a>
+    <div class="job-card {{ job.status }} {{ 'needs-raw-check' if job.needs_raw_check else '' }}"
+         {% if job.needs_raw_check %}title="Check Jellyfin before deleting: {{ job.raw_check_reason }}"{% endif %}>
+      <a href="/media/job/{{ job.id }}" class="job-card-link">
+        <div class="job-card-name">{{ job.name }}</div>
+        <div class="job-card-meta">
+          <span class="badge {{ job.status }}">{{ job.status | capitalize }}</span>
+          <span>{{ job.title_count }} title{{ 's' if job.title_count != 1 else '' }}</span>
+          {% if job.needs_raw_check %}<span class="badge raw-check-badge">⚠ Check Jellyfin</span>{% endif %}
+        </div>
+        <div class="job-card-time">{{ job.created_at | reltime }}</div>
+      </a>
+      {% if job.needs_raw_check %}
+      <button class="btn btn-danger btn-sm raw-delete-btn"
+              onclick="confirmDeleteRaw('{{ job.id }}', event)"
+              title="Check Jellyfin before deleting: {{ job.raw_check_reason }}">
+        🗑 Confirm played in Jellyfin — delete raw
+      </button>
+      {% endif %}
+    </div>
     {% endfor %}
   </div>
 </section>

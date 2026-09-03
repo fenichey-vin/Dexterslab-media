@@ -10,6 +10,7 @@ implemented here. See mediaintel-catalog-plan.md.
 
 import json
 import re
+import subprocess
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -103,9 +104,12 @@ def backfill_from_completed_jobs():
 
 
 def _check_file(library_path):
-    """Read-only check of one file: exists, non-empty, ffprobe-readable.
-    Returns (state, fail_reason) where fail_reason is None when verified.
-    Never opens the file for writing, never deletes, never moves anything.
+    """Read-only check of one file: exists, non-empty, ffprobe-readable, and
+    actually decodable at three sample points (start/middle/end) rather than
+    just the header/index ffprobe reads. Returns (state, fail_reason) where
+    fail_reason is None when verified. Never opens the file for writing,
+    never deletes, never moves anything, and never decodes more than ~10s
+    per sample -- this is "does it play cleanly", not a full playthrough.
     """
     path = Path(library_path)
 
@@ -116,7 +120,46 @@ def _check_file(library_path):
     duration = get_duration(path)
     if not duration or duration <= 0:
         return 'failed', 'unreadable'
+
+    reason = _decode_sample_check(path, duration)
+    if reason:
+        return 'failed', reason
     return 'verified', None
+
+
+_SAMPLE_SECS = 10  # length of each decode sample
+
+
+def _decode_sample_check(path, duration):
+    """Actually decode ~10s of video at the start, middle, and end of the
+    file (not just read metadata) via ffmpeg -> /dev/null. Catches mid-file
+    corruption (bad sectors, truncated/interrupted copies with a valid
+    header) that ffprobe's metadata-only read would miss, while staying at
+    a fixed ~30s total regardless of the file's actual runtime -- this is
+    deliberately NOT a full playthrough. Returns a fail_reason string, or
+    None if all three samples decoded cleanly.
+    """
+    # Sample offsets: start (just past any intro black/logo), true middle,
+    # and end (backed off far enough that a short file still has room for
+    # a full _SAMPLE_SECS-length sample before EOF).
+    offsets = sorted({
+        max(0.0, 2.0),
+        max(0.0, duration / 2 - _SAMPLE_SECS / 2),
+        max(0.0, duration - _SAMPLE_SECS - 2.0),
+    })
+
+    for offset in offsets:
+        try:
+            r = subprocess.run(
+                ['ffmpeg', '-v', 'error', '-ss', str(offset), '-i', str(path),
+                 '-t', str(_SAMPLE_SECS), '-f', 'null', '-'],
+                capture_output=True, text=True, timeout=60,
+            )
+        except subprocess.TimeoutExpired:
+            return 'decode_timeout'
+        if r.returncode != 0 or r.stderr.strip():
+            return 'decode_error'
+    return None
 
 
 def verify_pending_rows():

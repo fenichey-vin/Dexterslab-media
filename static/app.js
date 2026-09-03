@@ -361,6 +361,25 @@ function encodeJob(jobId, event) {
     .catch(e => alert('Network error: ' + e));
 }
 
+function confirmDeleteRaw(jobId, event) {
+  if (event) { event.preventDefault(); event.stopPropagation(); }
+  if (!confirm(
+    'Have you confirmed this title plays correctly in Jellyfin?\n\n' +
+    'This will permanently delete the raw rip still on the SSD. ' +
+    'Automatic verification flagged a problem with this job, so only ' +
+    'confirm this after checking Jellyfin yourself.'
+  )) return;
+  apiPost(`/media/job/${jobId}/confirm-delete-raw`, {})
+    .then(r => {
+      if (r.ok) {
+        location.reload();
+      } else {
+        alert('Error: ' + (r.error || 'unknown'));
+      }
+    })
+    .catch(e => alert('Network error: ' + e));
+}
+
 // ── Global "already ripped?" search ──────────────────────────────────────────
 
 (function () {

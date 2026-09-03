@@ -216,6 +216,23 @@ def dashboard():
     staged    = [j for j in all_jobs if j['status'] == 'staged']
     completed = [j for j in all_jobs if j['status'] == 'complete']
     failed    = [j for j in all_jobs if j['status'] == 'error']
+
+    # A completed job's raw SSD folder should have been auto-deleted the
+    # moment every title verified as written + playable on the HDD (see
+    # _verify_and_cleanup_job). If it's still sitting there AND at least one
+    # of its titles failed that verification, that's not "hasn't gotten to
+    # it yet" -- it's "verification found a problem and intentionally left
+    # the raw copy in place." Flag those so a human checks Jellyfin before
+    # anyone deletes the only remaining safety copy.
+    for j in completed:
+        rows = db.get_catalog_rows_for_job(j['id'])
+        has_failed = any(r['state'] == 'failed' for r in rows)
+        raw_present = Path(j['review_path']).exists() if j.get('review_path') else False
+        j['needs_raw_check'] = has_failed and raw_present
+        if j['needs_raw_check']:
+            fail_reasons = sorted({r['fail_reason'] for r in rows if r['state'] == 'failed' and r['fail_reason']})
+            j['raw_check_reason'] = ', '.join(fail_reasons) if fail_reasons else 'verification failed'
+
     total_titles = sum(j['title_count'] for j in all_jobs)
     return render_template('dashboard.html',
                            active=active, review=review,
@@ -598,6 +615,37 @@ def cleanup_all_verified():
     return jsonify({'ok': True, 'cleaned': len(cleaned_ids), 'freed_bytes': total_freed, 'job_ids': cleaned_ids})
 
 
+@app.route('/media/job/<job_id>/confirm-delete-raw', methods=['POST'])
+def confirm_delete_raw(job_id):
+    """Manual override for the auto verify->cleanup pipeline. Used when a
+    title failed the automatic ffprobe verification (so its SSD raw folder
+    was deliberately left in place, and the job shows a red 'check Jellyfin
+    before deleting' warning on the dashboard) but Vinnie has manually played
+    it back in Jellyfin and confirmed it's actually fine. Unlike the
+    automatic path, this does NOT require every catalog row to already be
+    'verified' -- that's the whole point of a manual override -- but it does
+    require the job to actually be 'complete' (i.e. fully committed to the
+    library first) so this can never be used to delete a job's only copy of
+    something that was never written to the HDD in the first place.
+    """
+    job = db.get_job(job_id)
+    if not job:
+        return jsonify({'error': 'Not found'}), 404
+    if job['status'] != 'complete':
+        return jsonify({'error': f'Job is not complete (currently: {job["status"]})'}), 400
+    review_path = Path(job['review_path'])
+    if not review_path.exists():
+        return jsonify({'error': 'Nothing to delete (already cleaned, or raw path missing)'}), 404
+
+    freed = sum(f.stat().st_size for f in review_path.rglob('*') if f.is_file())
+    shutil.rmtree(str(review_path))
+
+    now = datetime.now(timezone.utc).isoformat()
+    for row in db.get_catalog_rows_for_job(job_id):
+        db.update_catalog_state(row['id'], 'cleaned', cleaned_at=now)
+    return jsonify({'ok': True, 'freed_bytes': freed})
+
+
 # ── Encode ───────────────────────────────────────────────────────────────────
 
 @app.route('/media/encode-all', methods=['POST'])
@@ -768,6 +816,35 @@ def _maybe_complete_staged_job(job_id):
     titles = db.get_titles(job_id)
     if not any(t.get('staged_path') for t in titles):
         db.set_job_status(job_id, 'complete')
+        # Every title in this job has just been committed to the library
+        # (written to the HDD). Kick off the write-verify-delete pipeline in
+        # the background right now instead of waiting on a periodic sweep --
+        # nothing here is allowed to loosen what _cleanup_job_raw already
+        # requires (every title independently verified as present, non-empty,
+        # and ffprobe-playable) before the SSD source folder is removed.
+        threading.Thread(target=_verify_and_cleanup_job, args=(job_id,), daemon=True).start()
+
+
+def _verify_and_cleanup_job(job_id):
+    """Background: verify every just-committed title actually landed on the
+    HDD and plays, then delete the SSD raw-rip folder for this job -- but
+    only once every title checks out. If any title fails verification, nothing
+    is deleted; the failure is recorded on its catalog row (state='failed',
+    fail_reason set) so the dashboard can flag the job for a human to check
+    Jellyfin before manually confirming deletion.
+    """
+    try:
+        for row in db.get_catalog_rows_for_job(job_id):
+            if row['state'] in ('pending', 'committed'):
+                state, reason = catalog._check_file(row['library_path'])
+                if state == 'verified':
+                    db.update_catalog_state(row['id'], 'verified', verified_at=datetime.now(timezone.utc).isoformat())
+                else:
+                    db.update_catalog_state(row['id'], 'failed', fail_reason=reason)
+        job = db.get_job(job_id)
+        _cleanup_job_raw(job_id, job)
+    except Exception as e:
+        print(f'[commit-cleanup] job {job_id} verify/cleanup failed: {e}')
 
 
 def _is_within(path, root):

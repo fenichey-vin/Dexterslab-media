@@ -697,8 +697,43 @@
       .then(() => apiPost(`/media/job/${JOB_ID}/classify-all`, {}))
       .then(r => {
         if (r.ok) {
-          if (status) status.textContent = `Classifying ${r.queued} title(s) in background — refresh in a moment.`;
-          setTimeout(() => location.reload(), 8000);
+          // For TV, the standing workflow is: position/TMDb lookup is only
+          // ever a first-pass guess (it just echoes back the episode number
+          // typed in, with zero check against the disc's real content) --
+          // so automatically chain into the real check (dialogue transcript
+          // match) instead of leaving the operator to remember a second
+          // click. This is now the default path for every TV job, not an
+          // optional extra step.
+          if (ctx.type === 'tv') {
+            if (status) status.textContent =
+              `Looked up ${r.queued} title(s) — now verifying against dialogue ` +
+              `(this can take a few minutes)…`;
+            if (btn) btn.textContent = 'Verifying via transcript…';
+            apiPost(`/media/job/${JOB_ID}/verify-transcript`, {})
+              .then(vr => {
+                if (vr.ok) {
+                  if (status) status.textContent =
+                    'Looked up episodes and started transcript verification in the ' +
+                    'background — this can take a few minutes for a full disc. ' +
+                    'Refresh in a bit to see confirmed/mismatch results on each title.';
+                  setTimeout(() => location.reload(), 15000);
+                } else {
+                  if (btn) { btn.disabled = false; btn.textContent = label; }
+                  if (status) status.textContent =
+                    `Episode lookup done, but transcript verification failed to start: ` +
+                    `${vr.error || 'unknown'}. You can retry with the Verify via Transcript button.`;
+                }
+              })
+              .catch(() => {
+                if (btn) { btn.disabled = false; btn.textContent = label; }
+                if (status) status.textContent =
+                  'Episode lookup done, but transcript verification could not be started ' +
+                  '(network error). Retry with the Verify via Transcript button.';
+              });
+          } else {
+            if (status) status.textContent = `Classifying ${r.queued} title(s) in background — refresh in a moment.`;
+            setTimeout(() => location.reload(), 8000);
+          }
         } else {
           if (btn) { btn.disabled = false; btn.textContent = label; }
           if (status) status.textContent = 'Error: ' + (r.error || 'unknown');

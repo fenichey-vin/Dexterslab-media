@@ -262,6 +262,25 @@ code {
   color: #fff;
 }
 .btn-retry:hover { opacity: 0.88; }
+
+/* ─── Raw-cleanup verification-failed warning ────────────────────────────────── */
+.job-card.needs-raw-check {
+  border: 2px solid var(--c-error);
+  background: color-mix(in srgb, var(--c-error) 8%, var(--surface));
+}
+.job-card-link { display: block; text-decoration: none; color: inherit; }
+.raw-check-badge {
+  background: var(--c-error);
+  color: #fff;
+}
+.btn-danger {
+  background: var(--c-error);
+  color: #fff;
+  width: 100%;
+  margin-top: 10px;
+}
+.btn-danger:hover { opacity: 0.85; }
+.btn-sm { padding: 6px 10px; font-size: 0.78rem; }
 .btn-retry:disabled { opacity: 0.6; cursor: default; }
 
 .btn-discard {
