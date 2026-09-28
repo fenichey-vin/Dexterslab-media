@@ -43,7 +43,7 @@
     <div style="font-size:0.85rem;color:var(--muted)">
       or click to browse — multiple files OK
     </div>
-    <input id="file-input" type="file" accept=".mkv" multiple
+    <input id="file-input" type="file" accept=".mkv,.avi,.mp4,.mov" multiple
            style="display:none" onchange="handleFileSelect(this.files)">
   </div>
 
@@ -108,7 +108,7 @@ function handleDragLeave(e) {
 function handleDrop(e) {
   e.preventDefault();
   handleDragLeave(e);
-  const dropped = [...e.dataTransfer.files].filter(f => f.name.toLowerCase().endsWith('.mkv'));
+  const dropped = [...e.dataTransfer.files].filter(f => ['.mkv', '.avi', '.mp4', '.mov'].some(ext => f.name.toLowerCase().endsWith(ext)));
   if (!dropped.length) { alert('Please drop MKV files only.'); return; }
   addFiles(dropped);
 }

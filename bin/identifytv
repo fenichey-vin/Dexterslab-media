@@ -97,7 +97,7 @@ def tvmaze(show):
         return None
 
 
-def episode_pool(show, season):
+def episode_pool(show, season, title_count=None):
     ref = tvmaze(show)
     if not ref:
         return [], None
@@ -110,7 +110,114 @@ def episode_pool(show, season):
         eps.append({"season": e["season"], "episode": e["number"],
                     "title": e["name"], "summary": summary,
                     "runtime": e.get("runtime")})
-    return eps, imdb
+    eps.sort(key=lambda e: e["episode"])
+
+    # The fan-script reference site (springfieldspringfield) ALWAYS numbers
+    # its pages using the merged/DVD convention, one page per broadcast hour,
+    # regardless of whether the real season is numbered merged or split (see
+    # The Office S04 fix, 2026-09-03: site has exactly 14 pages for a season
+    # with 19 real episode numbers; s04e15-e19 all 404/redirect because that
+    # content lives on the combined s04e14 page instead). Compute the merged
+    # mapping FIRST so every episode -- whether we end up returning the
+    # merged or unmerged pool to the caller -- carries the correct
+    # _fetch_episode pointing at a page that actually exists on the site.
+    merged = _merge_multipart_episodes([dict(e) for e in eps])
+    fetch_map = {}
+    for me in merged:
+        for orig_ep in me["_orig_episodes"]:
+            fetch_map[orig_ep] = me["_fetch_episode"]
+
+    unmerged = [dict(e) for e in eps]
+    for e in unmerged:
+        e["_fetch_episode"] = fetch_map.get(e["episode"], e["episode"])
+
+    # Multi-part episodes are NOT always double-counted relative to the
+    # disc/upload's actual title count -- The Office S03's "A Benihana
+    # Christmas" merges into one broadcast hour (IMDb: single episode
+    # number), but The Office S04's writers'-strike-shortened season airs
+    # its five hour-long episodes as two SEPARATELY NUMBERED episodes each
+    # (IMDb: 19 total episodes, not 14). Blindly merging broke S04 the same
+    # way blindly NOT merging broke S03 (see the 2026-09-03 fixes for both).
+    # When we know the actual number of titles on disc/in the job, prefer
+    # whichever numbering scheme's episode count actually matches it --
+    # that is real, checkable evidence, unlike guessing from title-name
+    # patterns alone. Fall back to merged (the more common DVD convention)
+    # when there's no title_count to check against.
+    #
+    # IMPORTANT: when unmerged is selected, a merged pair's TWO real episodes
+    # will still both fetch the SAME combined script (both halves' dialogue
+    # run together on the site's single page for that broadcast hour) --
+    # n-gram matching against a shared script cannot itself distinguish which
+    # half is which. Callers relying on identifytv's automated high-confidence
+    # verdict for a merged-pair season should treat "already matched to an
+    # earlier title" collisions as a sign to fall back to manual dialogue
+    # bisection (sample slices, read for a plot-beat shift) rather than
+    # trusting whichever one the n-gram score happened to rank first.
+    if title_count is not None:
+        if len(unmerged) == title_count and len(merged) != title_count:
+            return unmerged, imdb
+        if len(merged) == title_count:
+            return merged, imdb
+        # neither matches exactly -- prefer whichever is closer, merged wins ties
+        if abs(len(unmerged) - title_count) < abs(len(merged) - title_count):
+            return unmerged, imdb
+    return merged, imdb
+
+
+# Multi-part episodes ("A Benihana Christmas (1)"/"(2)", "The Job (1)"/"(2)")
+# are common on sitcoms and get double-counted by TVmaze/IMDb-episode-guide
+# APIs relative to how DVDs/IMDb's own episode list actually number them:
+# TVmaze gives the pair two consecutive numbers, but IMDb (and the disc,
+# which authors the hour-long broadcast as ONE title) treats it as a single
+# episode. If left alone, every episode AFTER a merged pair is off by one
+# per merged pair -- exactly the cascade seen on The Office S03 2026-09-03
+# (13 of 23 titles ended up numbered one high vs. IMDb once "A Benihana
+# Christmas" was hit). Detect "(1)"/"(2)" (or "(Part 1)"/"(Part 2)") title
+# suffixes on ADJACENT episode numbers and collapse them to a single DVD-style
+# episode entry, then renumber everything after contiguously from there.
+# This only fires on genuine multi-part pairs -- an unrelated show that
+# happens to have "(1)" in an unrelated title without a matching adjacent
+# "(2)" is left untouched.
+_PART_RE = re.compile(r"^\s*(.*?)\s*\(\s*(?:part\s*)?(\d+)\s*\)\s*$", re.I)
+
+
+def _merge_multipart_episodes(eps):
+    merged = []
+    i = 0
+    while i < len(eps):
+        e = eps[i]
+        m = _PART_RE.match(e["title"])
+        if m and m.group(2) == "1" and i + 1 < len(eps):
+            nxt = eps[i + 1]
+            m2 = _PART_RE.match(nxt["title"])
+            if m2 and m2.group(2) == "2" and m.group(1).strip().lower() == m2.group(1).strip().lower():
+                combined = dict(e)
+                combined["title"] = m.group(1).strip()
+                combined["summary"] = (e.get("summary") or "") + " " + (nxt.get("summary") or "")
+                combined["runtime"] = (e.get("runtime") or 0) + (nxt.get("runtime") or 0) or None
+                combined["_orig_episodes"] = [e["episode"], nxt["episode"]]
+                merged.append(combined)
+                i += 2
+                continue
+        e = dict(e)
+        e.setdefault("_orig_episodes", [e["episode"]])
+        merged.append(e)
+        i += 1
+    # Renumber contiguously (DVD/IMDb numbering has no gaps after a merge).
+    # The fan-script site's own page numbering follows this SAME sequential
+    # position -- one page per broadcast hour, counted 1..N after merging --
+    # not the original pre-merge TVmaze number(s), which we keep in
+    # _orig_episodes purely so episode_pool() can map EVERY original episode
+    # number (merged or not) back to the right site page, without key
+    # collisions between an unrelated episode's original number and another
+    # entry's post-renumber position (see The Office S04 fix, 2026-09-03:
+    # "Local Ad" was originally ep 9 but renumbers to merged position 5,
+    # which collided with "Launch Party"'s original numbers 5/6 and silently
+    # clobbered their correct fetch mapping).
+    for idx, e in enumerate(merged, start=1):
+        e["episode"] = idx
+        e["_fetch_episode"] = idx
+    return merged
 
 
 # ---------------------------------------------------------------- full scripts
@@ -134,6 +241,7 @@ SCRIPT_SITE = "https://www.springfieldspringfield.co.uk/view_episode_scripts.php
 SLUG_ALIASES = {
     "law-and-order-svu": "law-and-order-special-victims-unit",
     "law-order-svu": "law-and-order-special-victims-unit",
+    "the-office": "the-office-us",
 }
 
 
@@ -155,16 +263,27 @@ def fetch_episode_script(show, season, episode):
     m = re.search(r'<div class="scrolling-script-container">(.*?)</div>\s*</div>',
                   html, re.S)
     text = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", m.group(1))).strip() if m else ""
+    if len(text) < MIN_SCRIPT_CHARS:
+        # Don't cache stubs/empties — a wrong slug or transient site hiccup
+        # would otherwise poison this episode's lookup forever (seen with
+        # "the-office" vs the site's real "the-office-us" slug).
+        return None
     f.write_text(text)
     return text if len(text) >= MIN_SCRIPT_CHARS else None
 
 
 def attach_scripts(show, season, eps):
     """Best-effort: fetch a full transcript per episode, cached on disk.
-    Mutates eps in place, adding 'script' (may be None)."""
+    Mutates eps in place, adding 'script' (may be None).
+
+    Uses _fetch_episode (the original un-merged episode number) for the
+    fan-script lookup when a multi-part episode was collapsed by
+    _merge_multipart_episodes -- the site's URL/cache key scheme is keyed to
+    the pre-merge numbering, not the DVD/IMDb numbering used elsewhere."""
     got = 0
     for e in eps:
-        e["script"] = fetch_episode_script(show, season, e["episode"])
+        fetch_num = e.get("_fetch_episode", e["episode"])
+        e["script"] = fetch_episode_script(show, season, fetch_num)
         if e["script"]:
             got += 1
     return got
@@ -174,20 +293,51 @@ def attach_scripts(show, season, eps):
 _model = None
 
 
+def _english_audio_map(mkv):
+    """Return an ffmpeg -map arg (e.g. '0:3') for the English audio stream,
+    or None to let ffmpeg fall back to its default (first audio stream).
+
+    Multi-language discs (seen on The Office S02 upload, 2026-09-03) often
+    carry a foreign dub as audio stream 0 with English elsewhere -- ffmpeg's
+    default first-audio-stream selection silently transcribes the WRONG
+    LANGUAGE, and every downstream English-script match then fails or
+    mismatches. Always resolve the English-tagged stream explicitly rather
+    than trusting stream order.
+    """
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "a",
+             "-show_entries", "stream=index:stream_tags=language",
+             "-of", "json", str(mkv)],
+            capture_output=True, text=True, timeout=30,
+        )
+        info = json.loads(r.stdout or "{}")
+        streams = info.get("streams", [])
+        for st in streams:
+            if (st.get("tags", {}).get("language") or "").lower() in ("eng", "en"):
+                return f"0:{st['index']}"
+    except Exception:
+        pass
+    return None
+
+
 def transcribe(mkv, starts):
     """Sample a few windows of audio and return their combined text."""
     global _model
+    audio_map = _english_audio_map(mkv)
     code = r'''
 import sys, json, subprocess, tempfile, os
 from faster_whisper import WhisperModel
-mkv, starts = sys.argv[1], [int(x) for x in sys.argv[2].split(",")]
+mkv, starts, audio_map = sys.argv[1], [int(x) for x in sys.argv[2].split(",")], sys.argv[3] or None
 m = WhisperModel("base", device="cpu", compute_type="int8")
 out = []
 for s in starts:
     wav = tempfile.mktemp(suffix=".wav")
-    r = subprocess.run(["ffmpeg","-v","error","-y","-ss",str(s),"-t","%d",
-                        "-i",mkv,"-ac","1","-ar","16000",wav],
-                       capture_output=True)
+    cmd = ["ffmpeg","-v","error","-y","-ss",str(s),"-t","%d","-i",mkv]
+    if audio_map:
+        cmd += ["-map", audio_map]
+    cmd += ["-ac","1","-ar","16000",wav]
+    r = subprocess.run(cmd, capture_output=True)
     if r.returncode != 0 or not os.path.exists(wav):
         continue
     segs,_ = m.transcribe(wav, beam_size=1)
@@ -196,7 +346,7 @@ for s in starts:
 print(json.dumps(out))
 ''' % SAMPLE_SECS
     r = subprocess.run([str(WHISPER_PY), "-c", code, str(mkv),
-                        ",".join(str(s) for s in starts)],
+                        ",".join(str(s) for s in starts), audio_map or ""],
                        capture_output=True, text=True, timeout=1800)
     if r.returncode != 0:
         return None
@@ -393,6 +543,10 @@ def main():
     p.add_argument("--apply", action="store_true",
                    help="write suggestions into mediaintel for dashboard approval")
     p.add_argument("--force", action="store_true", help="ignore transcript cache")
+    p.add_argument("--titles",
+                   help="comma-separated title_num list to (re)verify only "
+                        "these titles, e.g. --titles 1,3,6,8,9 -- leaves every "
+                        "other title's existing classification untouched")
     a = p.parse_args()
 
     conn = db_connect()
@@ -404,6 +558,16 @@ def main():
                           (job_id,)).fetchall()
     if not titles:
         sys.exit(f"job {job_id} has no titles")
+    job_title_count = len(titles)
+
+    if a.titles:
+        try:
+            wanted = {int(x.strip()) for x in a.titles.split(",") if x.strip() != ""}
+        except ValueError:
+            sys.exit(f"--titles must be a comma-separated list of integers, got: {a.titles!r}")
+        titles = [t for t in titles if t["title_num"] in wanted]
+        if not titles:
+            sys.exit(f"none of --titles {sorted(wanted)} exist in job {job_id}")
 
     # work out the show/season
     show, season = a.show, a.season
@@ -424,7 +588,7 @@ def main():
     if not show:
         sys.exit("could not determine the show — pass --show \"Name\" --season N")
 
-    eps, imdb = episode_pool(show, season)
+    eps, imdb = episode_pool(show, season, title_count=job_title_count)
     print(f"\njob   : {job_id}")
     print(f"show  : {show}  season {season}   ({len(eps)} reference episodes"
           + (f", imdb {imdb}" if imdb else "") + ")")
@@ -486,6 +650,45 @@ def main():
 
         print(f"\n=== title_{n}  ({mins:.0f} min){flag}")
         print(f"     method: {method}")
+        # A tie where BOTH candidates score identically (not just close) is a
+        # distinct signature from a genuine "no match" (points == 0) or a
+        # genuine close call between two different scripts: it means the two
+        # candidate episodes' cached scripts are byte-identical -- almost
+        # always because the fan-script site pages multi-part episodes by
+        # broadcast HOUR while IMDb/DVD number them as separate episodes (see
+        # media-library-integrity skill's "Follow-up bug" section). No amount
+        # of re-sampling audio or retrying can ever break this tie: both
+        # candidates are being compared against the literal same text, so a
+        # different dialogue snippet just re-produces the identical scores.
+        # Surface this as its own reason rather than a bare "low confidence"
+        # so the operator (or a future retry) doesn't waste time re-running
+        # verify-transcript expecting a different result.
+        script_tie = None
+        if (best and len(ranked) > 1 and best["points"] > 0
+                and ranked[1]["points"] == best["points"]
+                and (best["season"], best["episode"]) != (ranked[1]["season"], ranked[1]["episode"])):
+            b_script = next((e.get("script") for e in eps_with_script
+                              if e["season"] == best["season"] and e["episode"] == best["episode"]), None)
+            r_script = next((e.get("script") for e in eps_with_script
+                              if e["season"] == ranked[1]["season"] and e["episode"] == ranked[1]["episode"]), None)
+            if b_script and r_script and b_script == r_script:
+                script_tie = {
+                    "reason": "shared_script_page",
+                    "candidates": [
+                        {"season": best["season"], "episode": best["episode"], "title": best["title"]},
+                        {"season": ranked[1]["season"], "episode": ranked[1]["episode"], "title": ranked[1]["title"]},
+                    ],
+                    "explanation": (
+                        f"S{best['season']:02d}E{best['episode']:02d} and "
+                        f"S{ranked[1]['season']:02d}E{ranked[1]['episode']:02d} share the exact same "
+                        "cached script page (site pages this multi-part episode by broadcast hour, "
+                        "not by IMDb/DVD episode number) -- dialogue matching cannot distinguish them "
+                        "no matter how many times it's re-run. Needs a human to watch and confirm which "
+                        "half this file actually is."
+                    ),
+                }
+                print("     [!] SHARED SCRIPT PAGE — cannot be disambiguated by dialogue, "
+                      "re-running will not help. Routing to manual review.")
         if not best or conf == "none":
             print("    no usable dialogue match")
         else:
@@ -504,13 +707,33 @@ def main():
                         "flag": flag.strip(), "confidence": conf,
                         "method": method,
                         "best": best, "runner_up": ranked[1] if len(ranked) > 1 else None,
-                        "transcript_chars": len(text)})
+                        "transcript_chars": len(text),
+                        "unresolvable": script_tie})
 
     out = review / "identification.json"
-    out.write_text(json.dumps(
-        {"job": job_id, "show": show, "season": season, "imdb": imdb,
-         "generated": datetime.now(timezone.utc).isoformat(),
-         "results": results}, indent=1))
+    if a.titles:
+        # Scoped run: merge into the existing report rather than clobber the
+        # other titles' prior results -- --titles is specifically for
+        # re-checking a handful of titles without disturbing everything else
+        # that already verified cleanly.
+        prior_report = {}
+        if out.exists():
+            try:
+                prior_report = json.loads(out.read_text())
+            except Exception:
+                prior_report = {}
+        merged_by_num = {r["title_num"]: r for r in prior_report.get("results", [])}
+        for r in results:
+            merged_by_num[r["title_num"]] = r
+        out.write_text(json.dumps(
+            {"job": job_id, "show": show, "season": season, "imdb": imdb,
+             "generated": datetime.now(timezone.utc).isoformat(),
+             "results": [merged_by_num[k] for k in sorted(merged_by_num)]}, indent=1))
+    else:
+        out.write_text(json.dumps(
+            {"job": job_id, "show": show, "season": season, "imdb": imdb,
+             "generated": datetime.now(timezone.utc).isoformat(),
+             "results": results}, indent=1))
     print(f"\nreport -> {out}")
 
     if a.apply:

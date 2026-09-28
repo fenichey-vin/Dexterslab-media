@@ -457,6 +457,21 @@ code {
   border: 1px solid rgba(249,115,22,.25);
   color: var(--c-staged);
 }
+.notice.error {
+  background: rgba(239,68,68,.12);
+  border: 1px solid var(--c-error);
+  color: var(--c-error);
+  font-weight: 600;
+}
+.notice.info {
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  color: var(--text);
+}
+.job-card-disc.warn {
+  color: var(--c-error);
+  font-weight: 600;
+}
 
 .staged-path {
   padding: 6px 16px 10px;

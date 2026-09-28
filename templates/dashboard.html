@@ -83,12 +83,15 @@
         {% if job.disc_label %}
         <div class="job-card-disc">{{ job.disc_label }}</div>
         {% endif %}
+        {% if job.notes %}
+        <div class="job-card-disc {{ 'warn' if ('⚠' in job.notes or 'DISAGREE' in job.notes or 'could not be confidently matched' in job.notes) else '' }}">{{ job.notes }}</div>
+        {% endif %}
         <div class="job-card-time">{{ job.created_at | reltime }}</div>
       </a>
       <button class="btn btn-remove" onclick="removeJob('{{ job.id }}', event)">✕ Remove</button>
     </div>
     {% else %}
-    <a href="/media/job/{{ job.id }}" class="job-card review">
+    <a href="/media/job/{{ job.id }}" class="job-card review {{ 'needs-raw-check' if (job.notes and ('⚠' in job.notes or 'DISAGREE' in job.notes or 'could not be confidently matched' in job.notes)) else '' }}">
       <div class="job-card-name">{{ job.name }}</div>
       <div class="job-card-meta">
         <span class="badge review">Classify Titles</span>
@@ -96,6 +99,9 @@
       </div>
       {% if job.disc_label %}
       <div class="job-card-disc">{{ job.disc_label }}</div>
+      {% endif %}
+      {% if job.notes %}
+      <div class="job-card-disc {{ 'warn' if ('⚠' in job.notes or 'DISAGREE' in job.notes or 'could not be confidently matched' in job.notes) else '' }}">{{ job.notes }}</div>
       {% endif %}
       <div class="job-card-time">{{ job.created_at | reltime }}</div>
     </a>

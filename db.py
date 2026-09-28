@@ -475,6 +475,18 @@ def update_catalog_state(catalog_id, state, verified_at=None, cleaned_at=None, f
         )
 
 
+def update_catalog_library_path(catalog_id, library_path):
+    """Update just the library_path column -- used when a title is moved
+    after commit (e.g. promoted out of the TV_REVIEW_DIR quarantine tree
+    into the real library) so the catalog keeps pointing at the file's
+    actual current location."""
+    with _db() as conn:
+        conn.execute(
+            'UPDATE catalog SET library_path=? WHERE id=?',
+            (str(library_path), catalog_id)
+        )
+
+
 def get_all_catalog_rows():
     with _db() as conn:
         rows = conn.execute('SELECT * FROM catalog ORDER BY committed_at DESC').fetchall()

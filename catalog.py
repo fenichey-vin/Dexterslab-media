@@ -130,6 +130,27 @@ def _check_file(library_path):
 _SAMPLE_SECS = 10  # length of each decode sample
 
 
+# Known-benign ffmpeg stderr chatter that does NOT indicate corruption --
+# confirmed harmless on 2026-09-04 by cross-checking against a full-file
+# decode (`ffmpeg -f null -`) on 4 freshly re-encoded, definitely-intact
+# library files (Sopranos S04E04/E05, Band of Brothers S01E01, SVU S01E10):
+# every one of them emits this exact "non monotonically increasing dts"
+# warning from the muxer somewhere in the file, with zero actual decode
+# errors. Treating ANY non-empty stderr as failure (the original logic)
+# produced a false positive on SVU S01E10 immediately after a verified-clean
+# re-encode -- the check would have kept re-flagging a genuinely fixed file
+# as corrupt forever. Only fail on stderr that actually names a real decode
+# problem; an unrecognized-but-nonzero-returncode case is still a hard fail.
+_BENIGN_STDERR_PATTERNS = (
+    'non monotonically increasing dts',
+)
+
+
+def _is_benign_stderr(stderr_text):
+    lines = [ln.strip() for ln in stderr_text.strip().splitlines() if ln.strip()]
+    return all(any(p in ln for p in _BENIGN_STDERR_PATTERNS) for ln in lines)
+
+
 def _decode_sample_check(path, duration):
     """Actually decode ~10s of video at the start, middle, and end of the
     file (not just read metadata) via ffmpeg -> /dev/null. Catches mid-file
@@ -137,7 +158,8 @@ def _decode_sample_check(path, duration):
     header) that ffprobe's metadata-only read would miss, while staying at
     a fixed ~30s total regardless of the file's actual runtime -- this is
     deliberately NOT a full playthrough. Returns a fail_reason string, or
-    None if all three samples decoded cleanly.
+    None if all three samples decoded cleanly (allowing known-benign muxer
+    warnings -- see _BENIGN_STDERR_PATTERNS -- which are not corruption).
     """
     # Sample offsets: start (just past any intro black/logo), true middle,
     # and end (backed off far enough that a short file still has room for
@@ -157,7 +179,9 @@ def _decode_sample_check(path, duration):
             )
         except subprocess.TimeoutExpired:
             return 'decode_timeout'
-        if r.returncode != 0 or r.stderr.strip():
+        if r.returncode != 0:
+            return 'decode_error'
+        if r.stderr.strip() and not _is_benign_stderr(r.stderr):
             return 'decode_error'
     return None
 

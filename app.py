@@ -22,10 +22,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from flask import (Flask, render_template, request, jsonify,
                    send_from_directory, Response, redirect, url_for)
 from config import (REVIEW_DIR, DB_PATH, PORT, ANTHROPIC_API_KEY, ANTHROPIC_MODEL,
-                    TV_DIR, MOVIES_DIR, SPECIALS_DIR, STAGING_DIR,
+                    TV_DIR, MOVIES_DIR, SPECIALS_DIR, STAGING_DIR, TV_REVIEW_DIR,
                     HB_PRESET, HB_FILTERS, HB_AUDIO)
 import db
 import catalog
+from transcript_utils import canonical_tv_show_name, identifytv_failure_note
 import tmdb
 from disc import (detect_drives, scan_disc, flag_titles, rip_title, get_duration,
                    take_screenshots, check_makemkv_version, _friendly_drive_label)
@@ -36,12 +37,24 @@ app.config['MAX_CONTENT_LENGTH'] = None  # MKVs can be many GB
 
 # ── Encode queue (one job at a time) ─────────────────────────────────────────
 _encode_queue = _queue.Queue()
+# Held for the entire lifetime of any single HandBrakeCLI encode, whether
+# started normally via the queue worker below OR by an orphaned-process
+# watcher in _startup_recovery(). Without this, a restart that finds a live
+# orphaned encode (still running under KillMode=process) would immediately
+# pull the NEXT queued job and start a second HandBrakeCLI concurrently --
+# exactly what happened 2026-09-05 (Office S03's orphaned encode + a freshly
+# re-queued Raymond S02 both encoding at once, load avg 17+ on a 4-core box).
+# The watcher in _startup_recovery acquires this before it starts polling an
+# orphaned PID and releases it only once that PID exits; the worker acquires
+# it before calling _encode_job_bg. Same job, same guarantee, one gate.
+_encode_lock = threading.Lock()
 
 def _encode_worker():
     while True:
         job_id = _encode_queue.get()
         try:
-            _encode_job_bg(job_id)
+            with _encode_lock:
+                _encode_job_bg(job_id)
         except Exception:
             pass
         finally:
@@ -50,17 +63,110 @@ def _encode_worker():
 threading.Thread(target=_encode_worker, daemon=True).start()
 
 
+def _resume_ingesting_job(job_id):
+    """Finish a job left in 'ingesting' by a restart mid-rip.
+
+    Phase 1 (MakeMKV) titles are unaffected by a restart other than the
+    current in-flight rip, since each title's .mkv is written and its DB row
+    added before moving to the next -- there is no partial-title case beyond
+    a possibly-incomplete last .mkv, which we detect and skip. Phase 2
+    (screenshots + duration + flags + auto-classify) runs in a bare daemon
+    thread after the disc is ejected, with no PID/checkpoint persisted
+    anywhere, so a restart during Phase 2 silently drops it for every title
+    that hadn't been screenshotted yet -- exactly what happened to Everybody
+    Loves Raymond S01 (2026-09-05): the job sat at 'ingesting' with 6 of 22
+    titles missing DB rows and screenshots, with no live process anywhere.
+    """
+    try:
+        job = db.get_job(job_id)
+        if not job:
+            return
+        job_dir = Path(job['review_path'])
+        if not job_dir.exists():
+            return
+
+        title_dirs = sorted(
+            (p for p in job_dir.glob('title_*') if p.is_dir()),
+            key=lambda p: int(p.name.split('_')[1])
+        )
+        if not title_dirs:
+            return
+
+        existing = {t['title_num'] for t in db.get_titles(job_id)}
+        effective_ctx = _get_effective_context(job)
+        is_tv_job = bool(effective_ctx and effective_ctx.get('type') == 'tv')
+
+        finished_any = False
+        for title_dir in title_dirs:
+            title_num = int(title_dir.name.split('_')[1])
+            mkv_files = sorted(title_dir.glob('*.mkv'))
+            if not mkv_files:
+                continue  # Phase 1 never finished this title -- nothing to recover
+            mkv = mkv_files[0]
+
+            duration = get_duration(mkv)
+            flagged  = flag_titles([{'num': title_num, 'dur_secs': duration, 'flags': []}])
+            final_flags = flagged[0]['flags']
+            rel_mkv = str(mkv.relative_to(REVIEW_DIR))
+
+            needs_screenshots = title_num not in existing or not (
+                db.get_title(job_id, title_num) or {}
+            ).get('screenshots')
+            screenshots = []
+            if needs_screenshots:
+                screenshots = take_screenshots(mkv, title_dir / 'screenshots', duration)
+
+            if title_num in existing:
+                if screenshots:
+                    db.update_title(job_id, title_num, screenshots=screenshots)
+            else:
+                db.add_title(job_id, title_num, rel_mkv, duration,
+                             mkv.stat().st_size, screenshots, final_flags)
+                existing.add(title_num)
+
+            if duration and duration < 480:
+                _auto_classify_short(job_id, title_num, None)
+            elif is_tv_job:
+                pass
+            elif ANTHROPIC_API_KEY:
+                _auto_classify_one(job_id, title_num, None)
+
+            finished_any = True
+
+        if finished_any:
+            print(f"[recovery] job {job_id}: resumed post-processing for titles "
+                  f"stranded 'ingesting' by a prior restart — now {len(existing)} title(s), status→review")
+            db.set_job_status(job_id, 'review')
+    except Exception as e:
+        print(f"[recovery] job {job_id}: failed to resume ingesting job: {e}")
+
+
 def _startup_recovery():
-    """Recover jobs stuck in 'encoding' from a previous service run.
+    """Recover jobs stuck in 'encoding' or 'queued' from a previous service run.
 
     With KillMode=process in systemd, HandBrakeCLI survives a Flask restart.
     On boot: if the process is still alive, wait for it then re-queue.
     If it's dead, delete any partial staging files and re-queue immediately.
+
+    The encode queue is an in-memory Queue() -- any job that was sitting in
+    status 'queued' (approved, waiting its turn) at the moment of restart is
+    silently orphaned unless we re-add it here too, since nothing else will
+    ever pick it back up.
     """
     all_jobs = db.get_all_jobs()
+
+    # A job stuck in 'ingesting' means either Phase 1 (MakeMKV ripping) or
+    # Phase 2 (screenshots/classification, run in a plain daemon thread with
+    # no PID persisted anywhere) was killed by a restart. Phase 1 is
+    # self-evident from disk (a title dir with no .mkv file yet); Phase 2 is
+    # silent -- exactly the bug that stranded Everybody Loves Raymond S01 at
+    # 'ingesting' with 6/22 titles missing DB rows/screenshots after a
+    # same-second service restart (2026-09-05). Detect and finish it here.
+    ingesting = [j for j in all_jobs if j['status'] == 'ingesting']
+    for job in ingesting:
+        threading.Thread(target=_resume_ingesting_job, args=(job['id'],), daemon=True).start()
+
     stuck = [j for j in all_jobs if j['status'] == 'encoding']
-    if not stuck:
-        return
 
     # Collect paths that are legitimately complete (referenced in titles.staged_path)
     legitimate_staged = set()
@@ -69,7 +175,15 @@ def _startup_recovery():
             if t.get('staged_path'):
                 legitimate_staged.add(t['staged_path'])
 
-    # Identify live orphaned HandBrake processes and the files they're writing
+    # Identify live orphaned HandBrake processes and the files they're writing.
+    # IMPORTANT: this whole block -- detection, lock acquisition, and watcher
+    # spawn -- runs BEFORE anything is added to _encode_queue below. The
+    # worker thread (started at module import) is blocked on an empty queue
+    # until then, so acquiring _encode_lock here synchronously on the main
+    # thread cannot deadlock against it. Reversing this order would let the
+    # worker grab the lock for a freshly re-queued job first, and this
+    # function's synchronous acquire() would then hang forever waiting for
+    # it, permanently stalling service startup before app.run() is reached.
     active_output_files = set()
     live_pid_by_job = {}
     for job in stuck:
@@ -105,16 +219,36 @@ def _startup_recovery():
             pid = live_pid_by_job[job_id]
             print(f'[recovery] job {job_id}: HandBrake PID {pid} still running — monitoring')
 
-            def _watch(jid=job_id, p=pid):
-                while True:
-                    try:
-                        os.kill(p, 0)
-                        time.sleep(10)
-                    except (ProcessLookupError, PermissionError):
-                        break
-                print(f'[recovery] PID {p} finished — re-queuing {jid}')
-                db.set_encode_progress(jid, None)
-                db.set_job_status(jid, 'approved')
+            # Non-blocking: normally there is at most one live orphaned encode
+            # and this succeeds immediately. If a PRIOR bug already let two
+            # HandBrakeCLI processes run concurrently (this exact scenario
+            # happened 2026-09-05), a second stuck+live job here would find
+            # the lock already held by the first job's watcher -- a blocking
+            # acquire() would then hang this synchronous startup loop forever,
+            # since nothing releases it until that first process exits.
+            # Non-blocking avoids that: we still watch and re-queue the
+            # second process on exit (correctness), we just don't hold the
+            # lock for it (only matters for an already-anomalous state that
+            # this same fix prevents from recurring going forward).
+            got_lock = _encode_lock.acquire(blocking=False)
+            if not got_lock:
+                print(f'[recovery] job {job_id}: encode lock already held by another '
+                      f'recovered job -- watching without lock (pre-existing double-encode state)')
+
+            def _watch(jid=job_id, p=pid, held=got_lock):
+                try:
+                    while True:
+                        try:
+                            os.kill(p, 0)
+                            time.sleep(10)
+                        except (ProcessLookupError, PermissionError):
+                            break
+                    print(f'[recovery] PID {p} finished — re-queuing {jid}')
+                    db.set_encode_progress(jid, None)
+                    db.set_job_status(jid, 'approved')
+                finally:
+                    if held:
+                        _encode_lock.release()
                 _encode_queue.put(jid)
 
             threading.Thread(target=_watch, daemon=True).start()
@@ -123,6 +257,16 @@ def _startup_recovery():
             db.set_encode_progress(job_id, None)
             db.set_job_status(job_id, 'approved')
             _encode_queue.put(job_id)
+
+    # Re-add jobs that were sitting in 'queued' (approved, waiting their turn)
+    # at the moment of restart. Placed AFTER the orphaned-encode block above:
+    # if an orphaned encode's watcher is now holding _encode_lock, these will
+    # sit safely in the queue behind it instead of racing to start a second
+    # concurrent HandBrakeCLI process while the orphan is still running.
+    orphaned_queued = [j for j in all_jobs if j['status'] == 'queued']
+    for job in orphaned_queued:
+        print(f"[recovery] job {job['id']}: was 'queued' at restart — re-adding to encode queue")
+        _encode_queue.put(job['id'])
 
 
 # ── Template filters ─────────────────────────────────────────────────────────
@@ -458,6 +602,12 @@ def verify_transcript(job_id):
     Anything it can't confidently identify is left for manual review rather
     than guessed. Safe to run on a job mid-rip or already classified --
     identifytv only reads MKVs, never touches the drive.
+
+    Optional JSON body: {"titles": [1,3,6,8,9]} re-verifies only those
+    title_nums (via identifytv --titles), leaving every other title's
+    existing classification/verification untouched -- for re-checking a
+    handful of titles after a manual correction or a screenshot retake
+    without re-running (and re-billing whisper time for) the whole job.
     """
     job = db.get_job(job_id)
     if not job:
@@ -468,7 +618,24 @@ def verify_transcript(job_id):
                                   'transcript matching needs to know what show '
                                   'to check dialogue against.'}), 400
 
-    db.set_job_status(job_id, job['status'], notes='Verifying via transcript…')
+    canonical_show = canonical_tv_show_name(ctx['show'])
+    if canonical_show != ctx['show']:
+        ctx = dict(ctx)
+        ctx['show'] = canonical_show
+        db.set_disc_context(job_id, ctx)
+
+    body = request.get_json(silent=True) or {}
+    scoped_titles = body.get('titles')
+    if scoped_titles is not None:
+        try:
+            scoped_titles = sorted({int(n) for n in scoped_titles})
+        except (TypeError, ValueError):
+            return jsonify({'error': '"titles" must be a list of title numbers'}), 400
+        if not scoped_titles:
+            return jsonify({'error': '"titles" was empty — nothing to verify'}), 400
+
+    scope_note = f' (title_{", title_".join(map(str, scoped_titles))} only)' if scoped_titles else ''
+    db.set_job_status(job_id, job['status'], notes=f'Verifying via transcript{scope_note}…')
 
     def _bg():
         try:
@@ -476,7 +643,21 @@ def verify_transcript(job_id):
                    '--show', ctx['show'], '--apply']
             if ctx.get('season'):
                 cmd += ['--season', str(ctx['season'])]
-            subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+            if scoped_titles:
+                # --force too: a scoped re-run only makes sense after
+                # something changed (manual correction, new screenshots) --
+                # serving a stale cached transcript from the failed first
+                # pass would defeat the point of retrying.
+                cmd += ['--titles', ','.join(str(n) for n in scoped_titles), '--force']
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+            if result.returncode != 0:
+                safe_note = identifytv_failure_note(
+                    result.returncode,
+                    (result.stdout or '') + '\n' + (result.stderr or ''),
+                )
+                db.set_job_status(job_id, job['status'], notes=safe_note)
+                print(f'[identifytv] {job_id}: exit {result.returncode} — {safe_note}')
+                return
         except Exception as e:
             db.set_job_status(job_id, job['status'], notes=f'Transcript verify failed: {e}')
             return
@@ -485,25 +666,61 @@ def verify_transcript(job_id):
         if report.exists():
             try:
                 data = json.loads(report.read_text())
-                low = [r['title_num'] for r in data.get('results', [])
-                       if r.get('confidence') not in ('high', 'medium')]
+                results = data.get('results', [])
+                if scoped_titles:
+                    results = [r for r in results if r['title_num'] in scoped_titles]
+
+                # Titles where dialogue matching hit a structural dead end
+                # (two real episodes sharing one cached script page) instead
+                # of a genuine "couldn't find anything" -- re-running this
+                # exact same verify-transcript call will NEVER produce a
+                # different result for these, so route straight to manual
+                # review with the reason attached rather than leaving them
+                # Unclassified for the operator to retry against, or worse,
+                # discover no differently on a second identical attempt.
+                unresolvable = [r for r in results if r.get('unresolvable')]
+                for r in unresolvable:
+                    tnum = r['title_num']
+                    cand = r['unresolvable']['candidates']
+                    db.save_classification(job_id, tnum, {
+                        'type': 'tv_episode',
+                        'show': ctx.get('show'),
+                        'season': ctx.get('season'),
+                        'episode': None,
+                        'episode_title': None,
+                        'confidence': 'none',
+                        '_source': 'manual_review_required',
+                        'needs_review_reason': r['unresolvable']['reason'],
+                        'needs_review_candidates': cand,
+                        'reasoning': r['unresolvable']['explanation'],
+                    })
+
+                low = [r['title_num'] for r in results
+                       if r.get('confidence') not in ('high', 'medium')
+                       and not r.get('unresolvable')]
                 # Also check what identifytv actually wrote to the DB for a
                 # mismatch flag (set when the transcript match disagreed with
                 # whatever "Look Up All Episodes" or a manual entry had) --
                 # this is the real answer to "does the disc match my input".
                 mismatched = [t['title_num'] for t in db.get_titles(job_id)
-                             if (t.get('classification') or {}).get('mismatch_with_prior')]
+                             if (t.get('classification') or {}).get('mismatch_with_prior')
+                             and (not scoped_titles or t['title_num'] in scoped_titles)]
                 parts = []
                 if mismatched:
                     parts.append(f'⚠ {len(mismatched)} title(s) DISAGREE with what you entered '
                                  f'(title_{", title_".join(map(str, mismatched))}) — check those cards')
+                if unresolvable:
+                    unum = [str(r['title_num']) for r in unresolvable]
+                    parts.append(f'🔁 {len(unresolvable)} title(s) hit a SHARED SCRIPT PAGE — cannot ever be '
+                                 f'resolved by re-running dialogue matching (title_{", title_".join(unum)}) — '
+                                 f'routed to manual review, watch and confirm in Jellyfin')
                 if low:
                     parts.append(f'{len(low)} title(s) could not be confidently matched '
                                  f'(title_{", title_".join(map(str, low))})')
                 if parts:
-                    note = 'Transcript verification complete — ' + '; '.join(parts) + '.'
+                    note = f'Transcript verification complete{scope_note} — ' + '; '.join(parts) + '.'
                 else:
-                    note = 'Transcript verification complete — every title agrees with what you entered.'
+                    note = f'Transcript verification complete{scope_note} — every title agrees with what you entered.'
             except Exception:
                 pass
         db.set_job_status(job_id, job['status'], notes=note)
@@ -812,6 +1029,57 @@ def _catalog_commit(job_id, n, title, cls, dest):
         pass
 
 
+@app.route('/media/job/<job_id>/title/<int:n>/confirm-and-move', methods=['POST'])
+def confirm_and_move_from_review(job_id, n):
+    """Promote one title from the TV_REVIEW_DIR quarantine tree into the real
+    TV_DIR library, once a human has actually watched it (in Jellyfin, as
+    its own separate 'Needs Review' library) and confirmed the episode
+    number/title is correct. This is the only path that moves a file out of
+    quarantine -- nothing does it automatically, no matter how much time
+    passes, because the whole point of the quarantine tree is that an
+    unconfirmed guess never silently graduates into the main library on its
+    own.
+
+    Also re-writes the title's classification with _source set to a
+    distinct manual-confirm marker (not identifytv_transcript, since dialogue
+    matching still never confirmed it -- this was a human eyeball check) so
+    the provenance trail stays honest about how this title was actually
+    verified.
+    """
+    row = db.get_catalog_row(job_id, n)
+    if not row:
+        return jsonify({'error': 'No catalog record for this title — was it ever committed?'}), 404
+
+    current = Path(row['library_path'])
+    if not current.exists():
+        return jsonify({'error': f'File not found on disk: {current}'}), 404
+    if not _is_within(current, TV_REVIEW_DIR):
+        return jsonify({'error': 'This title is not in the Needs Review quarantine tree — nothing to move'}), 400
+
+    title = db.get_title(job_id, n)
+    cls = (title or {}).get('classification') or {}
+    dest = TV_DIR / current.relative_to(TV_REVIEW_DIR)
+    if dest.exists():
+        return jsonify({'error': f'File already exists in the main library: {dest.name} — delete it first if you want to replace it'}), 409
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        shutil.move(str(current), str(dest))
+    except OSError as e:
+        return jsonify({'error': str(e)}), 500
+
+    now = datetime.now(timezone.utc).isoformat()
+    db.update_catalog_library_path(row['id'], str(dest))
+    db.update_catalog_state(row['id'], 'verified', verified_at=now)
+
+    cls = dict(cls)
+    cls['_source'] = 'manual_confirm_from_review'
+    cls['_confirmed_at'] = now
+    db.save_classification(job_id, n, cls)
+
+    return jsonify({'ok': True, 'dest': str(dest)})
+
+
 def _maybe_complete_staged_job(job_id):
     titles = db.get_titles(job_id)
     if not any(t.get('staged_path') for t in titles):
@@ -982,8 +1250,42 @@ def search_json():
     return jsonify({'results': results[:40]})
 
 
+_TRANSCRIPT_VERIFIED_SOURCES = {
+    'identifytv_transcript',
+    # Same underlying transcript/dialogue match as identifytv_transcript --
+    # the episode NUMBER was afterward remapped to IMDb/DVD's merged
+    # numbering convention (e.g. two-part episodes TVmaze counts as two
+    # numbers but IMDb/the disc count as one). Content identification was
+    # still a real transcript n-gram match; only the number scheme changed.
+    'identifytv_transcript_renumbered_imdb',
+    # A human sampled the actual dialogue (faster-whisper transcript) and
+    # confirmed the episode by content -- at least as reliable as the
+    # automated identifytv_transcript path, often more so since a person
+    # read the reasoning before committing it.
+    'manual_transcript_verified',
+}
+
+
+def _is_transcript_verified(cls):
+    """True only when the classification's content identification was
+    independently checked against the disc's real dialogue/transcript --
+    never true for a screenshot guess, a bare manual edit, or 'Look Up All
+    Episodes' alone, no matter how confident the operator is, because none
+    of those has ever verified the disc's real content against this
+    episode number/title."""
+    return (cls or {}).get('_source') in _TRANSCRIPT_VERIFIED_SOURCES
+
+
 def _route_library(cls, title_num):
-    """Build the final Jellyfin library path for a classification."""
+    """Build the final Jellyfin library path for a classification.
+
+    TV episodes that were never transcript-verified are routed into a
+    SEPARATE quarantine tree (TV_REVIEW_DIR) rather than blocked outright --
+    Vinnie still wants to watch them (in Jellyfin, as their own library) to
+    confirm/correct before they ever land in the same show/season folder as
+    verified episodes. See _promote_from_review for how a title graduates
+    from here into TV_DIR proper once confirmed by eye.
+    """
     t = cls.get('type', 'unknown')
     if t in ('play_all', 'deleted', 'unknown'):
         return None
@@ -995,7 +1297,8 @@ def _route_library(cls, title_num):
         fname  = f'{show} - S{season:02d}{"E"+str(ep).zfill(2) if ep else ""}'
         if etitle:
             fname += f' - {etitle}'
-        return TV_DIR / show / f'Season {season:02d}' / (fname + '.mkv')
+        root = TV_DIR if _is_transcript_verified(cls) else TV_REVIEW_DIR
+        return root / show / f'Season {season:02d}' / (fname + '.mkv')
     if t in ('movie', 'documentary'):
         title  = _safe_name(cls.get('movie_title') or cls.get('title') or 'Unknown Title')
         year   = cls.get('year')
@@ -1204,7 +1507,54 @@ def _encode_job_bg(job_id):
             _log(f'=== Encode aborted: all titles failed the runtime check ===')
             return
 
+    # ---- transcript-verification quarantine note (TV only) --------------
+    # A manually-typed episode number/title is a guess until dialogue
+    # transcript matching confirms it -- see _verify_and_cleanup_job's
+    # sibling concern on the other end of the pipeline (verifying the HDD
+    # write). Unverified TV episodes are NOT held back from encoding --
+    # Vinnie wants to actually watch them in Jellyfin to judge for himself,
+    # not be blocked pending an automated check that can stay inconclusive
+    # forever on some discs. Instead, _route_library sends anything without
+    # classification._source == 'identifytv_transcript' into TV_REVIEW_DIR
+    # (a separate quarantine tree/Jellyfin library) instead of TV_DIR, so an
+    # unconfirmed guess never lands in the same show/season folder as a
+    # confirmed episode. This just logs which titles took that path.
+    _unverified = [
+        _n for _n, _cls in encodable
+        if _cls.get('type') == 'tv_episode' and _cls.get('_source') != 'identifytv_transcript'
+    ]
+    if _unverified:
+        for _n in _unverified:
+            _log(f'QUARANTINE {job_id} title_{_n}: not transcript-verified — '
+                 f'will land in {TV_REVIEW_DIR}, not the main TV library')
+        _note = (f'{len(_unverified)} title(s) not transcript-verified '
+                 f'(title_{", title_".join(map(str, _unverified))}) — will commit into '
+                 f'"Needs Review" (Jellyfin: TV Shows — Needs Review) instead of the '
+                 f'main library. Watch there, then use Confirm & Move to Library once '
+                 f'you\'re satisfied it\'s correct.')
+        prior_notes = job.get('notes') or ''
+        # NOTE: intentionally 'encoding', not job['status'] -- `job` is a stale
+        # snapshot fetched before this function set the real DB status to
+        # 'encoding' above. Writing job['status'] back here silently reverted
+        # the job to its pre-encode status (e.g. 'queued'), making the
+        # dashboard show an actively-encoding job as stuck in the queue.
+        db.set_job_status(job_id, 'encoding',
+                          notes=(prior_notes + ' ' if prior_notes else '') + _note)
+
     ok = fail = 0
+    # Tracks staging paths this SAME encode run has already claimed, so a
+    # same-run filename collision (two titles briefly classified to the same
+    # episode -- e.g. two screenshot-guess titles both guessed "Pilot" before
+    # transcript verification corrected them) is never silently treated as
+    # "already staged, safe to alias." That exact bug stranded Office S01
+    # title_3/4/5 and S04 title_10 with dangling staged_path pointers to a
+    # DIFFERENT title's file: title_1 (real Health Care) legitimately staged
+    # as "Pilot.mkv" first; title_3 (real Basketball) collided on the same
+    # guessed filename, got silently skip-aliased onto title_1's file instead
+    # of encoding its own content, and once title_1's file was later moved to
+    # the library, title_3/4/5's staged_path pointed at nothing -- "staged
+    # file missing" on commit, with the real content never encoded at all.
+    _staged_this_run = {}
 
     for title_idx, (title_num, cls) in enumerate(encodable):
         title_dir = job_dir / f'title_{title_num}'
@@ -1218,9 +1568,23 @@ def _encode_job_bg(job_id):
         if staging_path is None:
             continue
 
-        # Skip — don't create _2 duplicates — if this filename already landed
-        # in staging from a different job for the same content.
         if staging_path.exists():
+            collided_with = _staged_this_run.get(str(staging_path))
+            if collided_with is not None:
+                # Same-run collision: another title in THIS job already
+                # claimed this exact filename. Aliasing here would silently
+                # discard title_num's real content -- refuse, and leave it
+                # unstaged so it surfaces as an obvious commit failure NOW
+                # rather than a mysteriously-missing file after the fact.
+                _log(f'ERROR {job_id} title_{title_num}: staging filename collides '
+                     f'with title_{collided_with} ({staging_path.name}) in this same '
+                     f'encode run -- both classified to the same episode. NOT staged; '
+                     f'reclassify one of these two titles and re-run encode.')
+                fail += 1
+                continue
+            # Pre-existing from an earlier run/job -- plausibly the same
+            # real content already encoded once (e.g. a re-approved job).
+            # Dedup as before.
             _log(f'SKIP {job_id} title_{title_num}: staging file already exists ({staging_path.name})')
             ok += 1
             db.update_title(job_id, title_num, staged_path=str(staging_path))
@@ -1242,6 +1606,7 @@ def _encode_job_bg(job_id):
 
         if rc == 0:
             ok += 1
+            _staged_this_run[str(staging_path)] = title_num
             db.update_title(job_id, title_num, staged_path=str(staging_path))
             _log(f'OK   {job_id} title_{title_num}: {staging_path}')
         else:
@@ -1913,10 +2278,15 @@ def upload_start():
     if not job_name:
         return jsonify({'error': 'Job name is required'}), 400
 
+    # Extension is cosmetic only -- ffprobe/ffmpeg/HandBrake downstream sniff
+    # the actual container from file bytes, and every upload is saved to disk
+    # as title_t00.mkv regardless of source format, so AVI/MP4/MOV sources
+    # flow through screenshotting/duration/classification/encoding unchanged.
+    ALLOWED_EXT = ('.mkv', '.avi', '.mp4', '.mov')
     files = request.files.getlist('files')
-    mkv_files = [f for f in files if f.filename.lower().endswith('.mkv')]
-    if not mkv_files:
-        return jsonify({'error': 'No MKV files found in upload'}), 400
+    video_files = [f for f in files if f.filename.lower().endswith(ALLOWED_EXT)]
+    if not video_files:
+        return jsonify({'error': 'No video files found in upload (accepted: .mkv, .avi, .mp4, .mov)'}), 400
 
     safe_name = re.sub(r'[^\w\s-]', '', job_name).strip()
     safe_name = re.sub(r'\s+', '-', safe_name)
@@ -1928,7 +2298,7 @@ def upload_start():
     db.create_job(job_id, job_name, job_dir)
 
     title_paths = []
-    for i, f in enumerate(mkv_files):
+    for i, f in enumerate(video_files):
         title_dir = job_dir / f'title_{i}'
         title_dir.mkdir(parents=True, exist_ok=True)
         dest = title_dir / f'title_t{i:02d}.mkv'
@@ -1946,11 +2316,28 @@ def upload_start():
 
 
 def _import_mkv_bg(job_id, title_paths):
-    """Background thread: take screenshots, flag, and auto-classify uploaded MKVs."""
+    """Background thread: take screenshots, flag, and auto-classify uploaded MKVs.
+
+    TV titles are NEVER auto-classified with Claude here, mirroring the disc-rip
+    path (see the long comment in _rip_disc_bg / take_screenshots section).
+    Screenshot-only guessing on TV episodes has repeatedly produced confident-
+    wrong or fabricated episode titles (see media-library-integrity skill,
+    2026-09-03 The Office S02 upload: 11/22 titles all guessed "Dundies").
+    Disc position/order and 3 static frames are not reliable signals for
+    distinguishing episodes of the same show. TV uploads are left Unclassified
+    so the operator runs "Look Up All Episodes" (deterministic TMDb lookup) or
+    "Verify via Transcript" (dialogue match) -- both far stronger signals than
+    screenshots. Movies/specials still use Claude since a single feature-length
+    title is easy to identify visually and has no sibling episodes to confuse
+    it with.
+    """
     try:
         job = db.get_job(job_id)
         if not job:
             return
+
+        effective_ctx = _get_effective_context(job)
+        is_tv_job = bool(effective_ctx and effective_ctx.get('type') == 'tv')
 
         raw_titles = [
             {'num': i, 'dur_secs': get_duration(p), 'flags': []}
@@ -1967,7 +2354,13 @@ def _import_mkv_bg(job_id, title_paths):
                 rel_mkv     = str(mkv_path.relative_to(REVIEW_DIR))
                 db.add_title(job_id, i, rel_mkv,
                              duration, mkv_path.stat().st_size, screenshots, final_flags)
-                if ANTHROPIC_API_KEY:
+
+                if duration and duration < 480:
+                    # Under 8 minutes — auto-classify as Special Features
+                    _auto_classify_short(job_id, i, None)
+                elif is_tv_job:
+                    pass  # leave unclassified — see docstring above
+                elif ANTHROPIC_API_KEY:
                     _auto_classify_one(job_id, i, None)
             except Exception:
                 pass
@@ -2093,6 +2486,50 @@ def retake_screenshots(job_id, n):
     return jsonify({'ok': True, 'urls': urls})
 
 
+@app.route('/media/job/<job_id>/screenshots', methods=['POST'])
+def retake_screenshots_bulk(job_id):
+    """Retake screenshots for a specific list of titles in one job -- for
+    re-checking the handful of titles a human corrected or that failed
+    transcript verification, without touching every other title's existing
+    (already-fine) screenshots. Body: {"titles": [1,3,6,8,9]}.
+    Per-title failures are collected and returned, not fatal to the batch.
+    """
+    body = request.get_json(silent=True) or {}
+    wanted = body.get('titles')
+    if not wanted:
+        return jsonify({'error': '"titles" (list of title numbers) is required'}), 400
+    try:
+        wanted = sorted({int(n) for n in wanted})
+    except (TypeError, ValueError):
+        return jsonify({'error': '"titles" must be a list of title numbers'}), 400
+
+    results = {}
+    errors  = []
+    for n in wanted:
+        title = db.get_title(job_id, n)
+        if not title:
+            errors.append(f'title_{n}: not found')
+            continue
+        mkv_path = REVIEW_DIR / title['filepath']
+        if not mkv_path.exists():
+            errors.append(f'title_{n}: MKV file not found on disk')
+            continue
+        try:
+            duration    = get_duration(mkv_path)
+            thumb_dir   = mkv_path.parent / 'screenshots'
+            screenshots = take_screenshots(mkv_path, thumb_dir, duration)
+        except Exception as e:
+            errors.append(f'title_{n}: {e}')
+            continue
+        if not screenshots:
+            errors.append(f'title_{n}: ffmpeg produced no frames')
+            continue
+        db.update_title(job_id, n, screenshots=screenshots)
+        results[f'title_{n}'] = [f'/media/screenshots/{s}' for s in screenshots]
+
+    return jsonify({'ok': True, 'retaken': list(results.keys()), 'urls': results, 'errors': errors})
+
+
 # ── Screenshot serving ────────────────────────────────────────────────────────
 
 @app.route('/media/screenshots/<path:filepath>')
@@ -2101,6 +2538,72 @@ def screenshot(filepath):
     if not full.exists():
         return 'Not found', 404
     return send_from_directory(str(full.parent), full.name)
+
+
+# ── Raw title video streaming (review-stage preview, pre-encode) ─────────────
+# Lets a human actually WATCH a not-yet-classified/not-yet-encoded raw rip
+# straight from the job review page, instead of judging solely off static
+# screenshot thumbnails + the transcript-match guess. Serves the untouched
+# review-stage .mkv (never the encoded library copy) with HTTP Range support
+# so the browser <video> element can seek/scrub.
+@app.route('/media/job/<job_id>/title/<int:n>/video')
+def title_video(job_id, n):
+    job = db.get_job(job_id)
+    if not job:
+        return 'Job not found', 404
+    title = db.get_title(job_id, n) if hasattr(db, 'get_title') else None
+    if title is None:
+        title = next((t for t in db.get_titles(job_id) if t['title_num'] == n), None)
+    if not title or not title.get('filepath'):
+        return 'Title not found', 404
+    mkv_path = REVIEW_DIR / title['filepath']
+    if not mkv_path.exists():
+        return 'Video file not found on disk', 404
+    return _stream_range(mkv_path)
+
+
+def _stream_range(path, chunk_size=1024 * 1024):
+    """Minimal HTTP Range responder so <video> seeking works without loading
+    the whole (often multi-GB) file into memory."""
+    file_size = path.stat().st_size
+    range_header = request.headers.get('Range', None)
+    if not range_header:
+        def generate_full():
+            with open(path, 'rb') as f:
+                while True:
+                    chunk = f.read(chunk_size)
+                    if not chunk:
+                        break
+                    yield chunk
+        resp = Response(generate_full(), mimetype='video/x-matroska')
+        resp.headers['Content-Length'] = str(file_size)
+        resp.headers['Accept-Ranges'] = 'bytes'
+        return resp
+
+    byte1, byte2 = 0, file_size - 1
+    m = re.search(r'bytes=(\d+)-(\d*)', range_header)
+    if m:
+        byte1 = int(m.group(1))
+        if m.group(2):
+            byte2 = int(m.group(2))
+    length = byte2 - byte1 + 1
+
+    def generate_range():
+        with open(path, 'rb') as f:
+            f.seek(byte1)
+            remaining = length
+            while remaining > 0:
+                chunk = f.read(min(chunk_size, remaining))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+                yield chunk
+
+    resp = Response(generate_range(), status=206, mimetype='video/x-matroska')
+    resp.headers['Content-Range'] = f'bytes {byte1}-{byte2}/{file_size}'
+    resp.headers['Accept-Ranges'] = 'bytes'
+    resp.headers['Content-Length'] = str(length)
+    return resp
 
 
 # ── Catalog status (read-only window into the catalog table) ─────────────────

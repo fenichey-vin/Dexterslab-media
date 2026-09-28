@@ -76,6 +76,9 @@
 {% if job.status == 'staged' %}
 <div class="notice staged">Encoded files are in <code>/srv/media/staging/</code> — watch them in Jellyfin, fix any classifications below, then click <strong>Move to Library</strong> on each title or <strong>Commit All</strong> to file them all at once.</div>
 {% endif %}
+{% if job.notes %}
+<div class="notice {{ 'error' if ('⚠' in job.notes or 'DISAGREE' in job.notes or 'could not be confidently matched' in job.notes) else 'info' }}">{{ job.notes }}</div>
+{% endif %}
 
 <!-- Job Summary (Phase 3, permanent provenance record) -->
 <section class="job-section">
@@ -187,8 +190,8 @@
                                gap:10px;flex-wrap:wrap">
         <div style="flex:3;min-width:150px">
           <label style="display:block;font-size:0.75rem;font-weight:600;color:var(--muted);
-                        text-transform:uppercase;letter-spacing:0.04em;margin-bottom:3px">Show</label>
-          <input id="ctx-show" type="text" placeholder="The Sopranos"
+                        text-transform:uppercase;letter-spacing:0.04em;margin-bottom:3px">Show — series title only</label>
+          <input id="ctx-show" type="text" placeholder="The Sopranos (not The Sopranos S06)"
                  value="{{ job.disc_context.show if job.disc_context and job.disc_context.show else '' }}"
                  style="background:var(--surface);border:1px solid var(--border);border-radius:5px;
                         padding:6px 9px;color:var(--text);font-size:0.88rem;outline:none;width:100%"
@@ -307,6 +310,23 @@
     </div>
     {% endif %}
 
+    <!-- Raw video preview: play the actual review-stage rip, not just static
+         screenshots + a transcript-match guess. Lazy-loaded (no <source> set
+         until the button is clicked) so opening a job page with 25 titles
+         doesn't try to open 25 video streams at once. -->
+    <div style="margin-bottom:8px">
+      <button class="cls-btn" style="font-size:0.78rem;padding:3px 10px"
+              id="video-toggle-btn-{{ t.title_num }}"
+              onclick="toggleVideoPreview({{ t.title_num }})">
+        ▶ Watch this title
+      </button>
+      <div id="video-wrap-{{ t.title_num }}" style="display:none;margin-top:6px">
+        <video id="video-player-{{ t.title_num }}" controls preload="none"
+               style="max-width:480px;width:100%;background:#000;border-radius:6px">
+        </video>
+      </div>
+    </div>
+
     <!-- Staged file info + commit button -->
     {% if t.staged_path %}
     <div class="staged-path" id="staged-row-{{ t.title_num }}">
@@ -357,6 +377,23 @@
         <div style="font-size:0.75rem;color:#7fbf7f;margin-top:4px">
           ✓ Confirmed by dialogue transcript match — this is what's actually on the disc.
         </div>
+        {% elif cls._source == 'manual_review_required' %}
+        <div style="background:#3a2e1e;border:1px solid #7a5a32;border-radius:6px;
+                    padding:8px 10px;margin-top:6px;font-size:0.8rem;color:#f0c090">
+          🔁 <strong>Cannot be resolved by dialogue matching — re-running will not help.</strong>
+          {{ cls.reasoning }}
+          {% if cls.needs_review_candidates %}
+          <div style="margin-top:6px">
+            Candidates:
+            {% for c in cls.needs_review_candidates %}
+              S{{ '%02d'|format(c.season|int) }}E{{ '%02d'|format(c.episode|int) }} — {{ c.title }}{% if not loop.last %}, {% endif %}
+            {% endfor %}
+          </div>
+          {% endif %}
+          <div style="margin-top:6px;color:#e8d0a8">
+            Watch this file in Jellyfin's "TV Shows — Needs Review" library once committed, then pick the right one manually.
+          </div>
+        </div>
         {% endif %}
         {% if cls.mismatch_with_prior %}
         <div style="background:#3a1e1e;border:1px solid #7a3232;border-radius:6px;
@@ -375,6 +412,10 @@
         {% endif %}
       {% else %}
         <div class="cls-badge cls-unknown">Unclassified</div>
+        <button class="btn btn-sm" style="margin-top:6px"
+                onclick="verifyTranscript([{{ t.title_num }}], this)">
+          🎙 Verify this title via transcript
+        </button>
       {% endif %}
     </div>
 
@@ -392,6 +433,16 @@
       &nbsp;·&nbsp; <span style="color:var(--muted)">not committed</span>
       {% endif %}
     </div>
+    {% if t.catalog_row and '/tv-needs-review/' in (t.catalog_row.library_path or '') %}
+    <div class="notice error" style="margin-bottom:8px">
+      ⚠ Not transcript-verified — committed to <strong>Needs Review</strong> (Jellyfin: TV Shows — Needs Review),
+      not the main library. Watch it there, then confirm below once you're sure it's correct.
+      <button class="btn btn-danger btn-sm" style="margin-left:10px"
+              onclick="confirmMoveFromReview('{{ job.id }}', {{ t.title_num }}, event)">
+        ✓ Confirm played in Jellyfin — move to main library
+      </button>
+    </div>
+    {% endif %}
     {% endif %}
 
     <!-- Possible-duplicate panel (Phase 2B, advisory only) -->
@@ -745,31 +796,45 @@
       });
   }
 
-  function verifyTranscript() {
+  function verifyTranscript(titleNums, btnEl) {
     const ctx    = _buildCtx();
     const status = document.getElementById('ctx-status');
     const btn    = document.getElementById('verify-transcript-btn');
+    const scoped = Array.isArray(titleNums) && titleNums.length > 0;
     if (!ctx || ctx.type !== 'tv' || !ctx.show) {
       if (status) status.textContent = 'Save Show + Season in Disc Context first.';
       return;
     }
-    if (btn) { btn.disabled = true; btn.textContent = 'Transcribing… (can take a few minutes)'; }
-    if (status) status.textContent = 'Sampling dialogue from each title and matching against episode scripts…';
+    // Only the main "Verify via Transcript" button (no scope) has a fixed
+    // #verify-transcript-btn to update; per-title buttons pass themselves
+    // in as btnEl so scoped calls don't stomp the main button's state.
+    if (!scoped && btn) { btn.disabled = true; btn.textContent = 'Transcribing… (can take a few minutes)'; }
+    if (scoped && btnEl) { btnEl.disabled = true; btnEl.textContent = '🎙 Transcribing…'; }
+    if (status) {
+      status.textContent = scoped
+        ? `Sampling dialogue from title ${titleNums.join(', ')} and matching against episode scripts…`
+        : 'Sampling dialogue from each title and matching against episode scripts…';
+    }
 
+    const body = scoped ? { titles: titleNums } : {};
     apiPost(`/media/job/${JOB_ID}/context`, { disc_context: ctx })
-      .then(() => apiPost(`/media/job/${JOB_ID}/verify-transcript`, {}))
+      .then(() => apiPost(`/media/job/${JOB_ID}/verify-transcript`, body))
       .then(r => {
         if (r.ok) {
-          if (status) status.textContent = 'Running in background — this can take a few minutes for a full disc. Refresh to see results.';
-          setTimeout(() => location.reload(), 15000);
+          if (status) status.textContent = scoped
+            ? `Running in background for title ${titleNums.join(', ')} — this only takes a moment. Refresh to see results.`
+            : 'Running in background — this can take a few minutes for a full disc. Refresh to see results.';
+          setTimeout(() => location.reload(), scoped ? 8000 : 15000);
         } else {
           if (status) status.textContent = 'Error: ' + (r.error || 'unknown');
         }
-        if (btn) { btn.disabled = false; btn.textContent = '🎙 Verify via Transcript'; }
+        if (!scoped && btn) { btn.disabled = false; btn.textContent = '🎙 Verify via Transcript'; }
+        if (scoped && btnEl) { btnEl.disabled = false; btnEl.textContent = '🎙 Verify this title via transcript'; }
       })
       .catch(() => {
         if (status) status.textContent = 'Network error.';
-        if (btn) { btn.disabled = false; btn.textContent = '🎙 Verify via Transcript'; }
+        if (!scoped && btn) { btn.disabled = false; btn.textContent = '🎙 Verify via Transcript'; }
+        if (scoped && btnEl) { btnEl.disabled = false; btnEl.textContent = '🎙 Verify this title via transcript'; }
       });
   }
 
@@ -834,6 +899,23 @@
         }
       })
       .catch(e => alert('Network error: ' + e));
+  }
+
+  function toggleVideoPreview(n) {
+    const wrap = document.getElementById('video-wrap-' + n);
+    const btn  = document.getElementById('video-toggle-btn-' + n);
+    const player = document.getElementById('video-player-' + n);
+    if (!wrap || !player) return;
+    const showing = wrap.style.display !== 'none';
+    if (showing) {
+      wrap.style.display = 'none';
+      player.pause();
+      if (btn) btn.textContent = '▶ Watch this title';
+    } else {
+      wrap.style.display = 'block';
+      if (!player.src) player.src = `/media/job/${JOB_ID}/title/${n}/video`;
+      if (btn) btn.textContent = '▼ Hide video';
+    }
   }
 
   function takeScreenshots(n) {

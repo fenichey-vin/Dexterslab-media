@@ -380,6 +380,24 @@ function confirmDeleteRaw(jobId, event) {
     .catch(e => alert('Network error: ' + e));
 }
 
+function confirmMoveFromReview(jobId, titleNum, event) {
+  if (event) { event.preventDefault(); event.stopPropagation(); }
+  if (!confirm(
+    'Have you watched this episode in Jellyfin (Needs Review library) and ' +
+    'confirmed the episode number/title is correct?\n\n' +
+    'This moves the file into the main TV library permanently.'
+  )) return;
+  apiPost(`/media/job/${jobId}/title/${titleNum}/confirm-and-move`, {})
+    .then(r => {
+      if (r.ok) {
+        location.reload();
+      } else {
+        alert('Error: ' + (r.error || 'unknown'));
+      }
+    })
+    .catch(e => alert('Network error: ' + e));
+}
+
 // ── Global "already ripped?" search ──────────────────────────────────────────
 
 (function () {
