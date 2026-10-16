@@ -321,9 +321,10 @@ def _english_audio_map(mkv):
     return None
 
 
-def transcribe(mkv, starts):
+def transcribe(mkv, starts, sample_secs=None):
     """Sample a few windows of audio and return their combined text."""
     global _model
+    sample_secs = sample_secs or SAMPLE_SECS
     audio_map = _english_audio_map(mkv)
     code = r'''
 import sys, json, subprocess, tempfile, os
@@ -344,10 +345,10 @@ for s in starts:
     out.append(" ".join(x.text.strip() for x in segs))
     os.unlink(wav)
 print(json.dumps(out))
-''' % SAMPLE_SECS
+''' % sample_secs
     r = subprocess.run([str(WHISPER_PY), "-c", code, str(mkv),
                         ",".join(str(s) for s in starts), audio_map or ""],
-                       capture_output=True, text=True, timeout=1800)
+                       capture_output=True, text=True, timeout=1800 + 60 * len(starts))
     if r.returncode != 0:
         return None
     try:
@@ -547,6 +548,18 @@ def main():
                    help="comma-separated title_num list to (re)verify only "
                         "these titles, e.g. --titles 1,3,6,8,9 -- leaves every "
                         "other title's existing classification untouched")
+    p.add_argument("--samples", type=int, default=None,
+                   help="number of audio windows to sample per title "
+                        "(default: 3 for titles >10min, 1 for shorter). "
+                        "Raise this for titles that keep coming back "
+                        "'no usable dialogue match' -- more windows means "
+                        "a better chance of landing on distinctive dialogue "
+                        "instead of a musical/action/silent stretch.")
+    p.add_argument("--sample-secs", type=int, default=None,
+                   help="length in seconds of each sampled window "
+                        f"(default: {SAMPLE_SECS}). Larger windows give the "
+                        "matcher more n-grams per sample at the cost of "
+                        "more whisper transcription time.")
     a = p.parse_args()
 
     conn = db_connect()
@@ -620,14 +633,29 @@ def main():
         mins = dur / 60
 
         cache_f = CACHE / f"{job_id}-title{n}.txt"
-        if cache_f.exists() and not a.force:
+        if cache_f.exists() and not a.force and not a.samples and not a.sample_secs:
             text = cache_f.read_text()
         else:
-            starts = [90, int(dur * 0.45), int(dur * 0.75)] if dur > 600 else [30]
-            starts = [s for s in starts if s < dur - 30]
-            print(f"title_{n}: transcribing {len(starts)} sample(s) "
-                  f"of {mins:.0f}min ...", flush=True)
-            text = transcribe(mkv, starts) or ""
+            if a.samples:
+                # Evenly spread N windows across the file (skip the first
+                # ~60s to avoid recap/credits), instead of the fixed
+                # 45%/75%-of-duration heuristic -- gives much denser, more
+                # even coverage when the default 1-3 windows keep landing
+                # on non-distinctive dialogue (action/music/silence).
+                n_windows = max(1, a.samples)
+                lo, hi = 60, max(61, dur - 30)
+                if n_windows == 1:
+                    starts = [lo]
+                else:
+                    step = (hi - lo) / (n_windows - 1)
+                    starts = [int(lo + i * step) for i in range(n_windows)]
+            else:
+                starts = [90, int(dur * 0.45), int(dur * 0.75)] if dur > 600 else [30]
+            starts = [s for s in starts if s < dur - 15]
+            sample_secs = a.sample_secs or SAMPLE_SECS
+            print(f"title_{n}: transcribing {len(starts)} sample(s) of "
+                  f"{sample_secs}s each ({mins:.0f}min total runtime) ...", flush=True)
+            text = transcribe(mkv, starts, sample_secs=sample_secs) or ""
             cache_f.write_text(text)
 
         eps_with_script = [e for e in eps if e.get("script")]
