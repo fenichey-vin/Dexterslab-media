@@ -8,3 +8,18 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+
+# --- baseline (fleet-wide, added by Joshua 2026-10-20) ---
+*.bak-*
+*.bak
+*.db.bak-*
+.env
+.env.*
+!.env.example
+node_modules/
+__pycache__/
+*.pyc
+logs/
+*.log
+.DS_Store
+# --- end baseline ---
